@@ -385,6 +385,25 @@ ASR:
     output_dir: tmp/
     # 模型类型：sense_voice (多语言) 或 paraformer (中文专用)
     model_type: sense_voice
+  SherpaSenseVoiceB2:
+    # 可回滚的 B2：Sherpa-ONNX + SenseVoice FP32 + 句内 Silero VAD 边界精修。
+    # 模型文件不进入 Git，需挂载 model.onnx、tokens.txt、silero_vad.onnx。
+    type: sherpa_sensevoice_b2
+    model_dir: models/sherpa-sensevoice-b2
+    model_filename: model.onnx
+    tokens_filename: tokens.txt
+    vad_model_path: silero_vad.onnx
+    output_dir: tmp/
+    language: zh
+    num_threads: 4
+    vad_enabled: true
+    vad_min_silence_duration: 0.5
+    vad_buffer_size_sec: 30
+    vad_pre_roll_ms: 320
+    vad_post_roll_ms: 240
+    min_segment_sec: 0.30
+    fallback_to_full_audio: true
+    audio_level_diagnostics: true
   SherpaParaformerASR:
     # 中文语音识别模型，可以运行在低性能设备（需手动下载模型，例如RK3566-2g）
     # 详细配置说明请参考：docs/sherpa-paraformer-guide.md
