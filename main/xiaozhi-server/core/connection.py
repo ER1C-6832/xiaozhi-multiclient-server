@@ -34,6 +34,7 @@ from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
+from core.providers.llm.usage import LLMUsageTurnTracker
 from plugins_func.loadplugins import auto_import_modules
 from plugins_func.register import Action, ActionResponse
 from core.auth import AuthenticationError
@@ -1031,6 +1032,49 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
+    def _start_llm_usage_turn(self, turn_id):
+        self._llm_usage_tracker = LLMUsageTurnTracker(
+            logger=self.logger.bind(tag=TAG),
+            turn_id=turn_id,
+            session_id=self.session_id,
+            model=getattr(self.llm, "model_name", None),
+        )
+
+    def _next_llm_usage_context(self, depth):
+        tracker = getattr(self, "_llm_usage_tracker", None)
+        if tracker is None or not getattr(self.llm, "supports_usage_context", False):
+            return None
+        purpose = "initial_response" if depth == 0 else "tool_followup"
+        return tracker.next_request(purpose)
+
+    def _finish_llm_usage_turn(self, status="completed"):
+        tracker = getattr(self, "_llm_usage_tracker", None)
+        if tracker is None:
+            return
+        tracker.finish(status)
+        self._llm_usage_tracker = None
+
+    def _record_llm_tool_usage(
+        self, tool_call_data, result, started_at, status="completed"
+    ):
+        tracker = getattr(self, "_llm_usage_tracker", None)
+        if tracker is None:
+            return
+        action = getattr(result, "action", None)
+        action_value = getattr(action, "name", None) or (
+            str(action) if action is not None else None
+        )
+        result_text = getattr(result, "result", None)
+        tracker.record_tool(
+            tool_name=tool_call_data.get("name", "unknown"),
+            argument_chars=len(tool_call_data.get("arguments") or ""),
+            result_chars=len(str(result_text)) if result_text is not None else 0,
+            execution_ms=(time.perf_counter() - started_at) * 1000,
+            action=action_value,
+            status=status,
+            requires_llm_followup=(action == Action.REQLLM),
+        )
+
     def chat(self, query, depth=0):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
@@ -1042,6 +1086,7 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
+            self._start_llm_usage_turn(current_sentence_id)
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1105,6 +1150,10 @@ class ConnectionHandler:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
+            usage_context = self._next_llm_usage_context(depth)
+            usage_kwargs = (
+                {"usage_context": usage_context} if usage_context is not None else {}
+            )
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
@@ -1113,6 +1162,7 @@ class ConnectionHandler:
                         memory_str, self.config.get("voiceprint", {}), speaker_for_system
                     ),
                     functions=functions,
+                    **usage_kwargs,
                 )
             else:
                 llm_responses = self.llm.response(
@@ -1120,9 +1170,12 @@ class ConnectionHandler:
                     self.dialogue.get_llm_dialogue_with_memory(
                         memory_str, self.config.get("voiceprint", {}), speaker_for_system
                     ),
+                    **usage_kwargs,
                 )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            if depth == 0:
+                self._finish_llm_usage_turn("request_error")
             return None
 
         # 处理流式响应
@@ -1215,6 +1268,7 @@ class ConnectionHandler:
                         content_type=ContentType.ACTION,
                     )
                 )
+                self._finish_llm_usage_turn("stream_error")
             return
         # 处理function call
         if tool_call_flag:
@@ -1286,6 +1340,9 @@ class ConnectionHandler:
                                     content_type=ContentType.ACTION,
                                 )
                             )
+                            self._finish_llm_usage_turn(
+                                "aborted" if self.client_abort else "completed"
+                            )
                         return
 
                     tool_calls_list = real_tool_calls
@@ -1320,17 +1377,22 @@ class ConnectionHandler:
                         ),
                         self.loop,
                     )
-                    futures_with_data.append((future, tool_call_data, tool_input))
+                    futures_with_data.append(
+                        (future, tool_call_data, tool_input, time.perf_counter())
+                    )
 
                 # 工具调用超时时间，可配置，默认30秒
                 tool_call_timeout = int(self.config.get("tool_call_timeout", 30))
                 # 等待协程结束（实际等待时长为最慢的那个）
                 tool_results = []
 
-                for future, tool_call_data, tool_input in futures_with_data:
+                for future, tool_call_data, tool_input, tool_started_at in futures_with_data:
                     try:
                         result = future.result(timeout=tool_call_timeout)
                         tool_results.append((result, tool_call_data))
+                        self._record_llm_tool_usage(
+                            tool_call_data, result, tool_started_at
+                        )
                         # 使用公共方法上报工具调用结果
                         enqueue_tool_report(self, tool_call_data['name'], tool_input, str(result.result) if result.result else None, report_tool_call=False)
 
@@ -1339,10 +1401,17 @@ class ConnectionHandler:
                             f"工具调用超时或异常: {tool_call_data['name']}, 错误: {e}"
                         )
                         # 超时时返回错误响应，避免整个流程卡死
-                        tool_results.append((
-                            ActionResponse(action=Action.ERROR, result="哎呀，网络遇到点问题，请稍后再试下！"),
-                            tool_call_data
-                        ))
+                        error_result = ActionResponse(
+                            action=Action.ERROR,
+                            result="哎呀，网络遇到点问题，请稍后再试下！",
+                        )
+                        tool_results.append((error_result, tool_call_data))
+                        self._record_llm_tool_usage(
+                            tool_call_data,
+                            error_result,
+                            tool_started_at,
+                            status="error",
+                        )
                         # 上报工具调用错误
                         enqueue_tool_report(self, tool_call_data['name'], tool_input, str(e), report_tool_call=False)
 
@@ -1369,6 +1438,9 @@ class ConnectionHandler:
                 lambda: json.dumps(
                     self.dialogue.get_llm_dialogue(), indent=4, ensure_ascii=False
                 )
+            )
+            self._finish_llm_usage_turn(
+                "aborted" if self.client_abort else "completed"
             )
 
         return True

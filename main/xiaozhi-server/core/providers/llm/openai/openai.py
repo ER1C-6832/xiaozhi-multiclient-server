@@ -1,9 +1,14 @@
 import openai
-from openai.types import CompletionUsage
+import time
 from config.logger import setup_logging
 from core.utils.util import check_model_key
 from core.providers.llm.base import LLMProviderBase
 from core.providers.llm.openai.client_config import build_openai_transport_config
+from core.providers.llm.usage import (
+    build_payload_profile,
+    create_usage_event,
+    emit_usage_event,
+)
 from urllib.parse import urlparse
 
 TAG = __name__
@@ -19,6 +24,8 @@ THINKING_DISABLED_DOMAINS = {
 
 
 class LLMProvider(LLMProviderBase):
+    supports_usage_context = True
+
     def __init__(self, config):
         self.model_name = config.get("model_name")
         self.api_key = config.get("api_key")
@@ -85,11 +92,14 @@ class LLMProvider(LLMProviderBase):
 
     def response(self, session_id, dialogue, **kwargs):
         dialogue = self.normalize_dialogue(dialogue)
+        usage_context = kwargs.get("usage_context")
+        payload_profile = build_payload_profile(dialogue)
 
         request_params = {
             "model": self.model_name,
             "messages": dialogue,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
 
         # 添加可选参数,只有当参数不为None时才添加
@@ -107,11 +117,18 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
+        started_at = time.perf_counter()
         responses = self.client.chat.completions.create(**request_params)
 
         is_active = True
-        try:            
+        final_usage = None
+        final_request_id = None
+        try:
             for chunk in responses:
+                usage_info = getattr(chunk, "usage", None)
+                if usage_info is not None:
+                    final_usage = usage_info
+                    final_request_id = getattr(chunk, "id", None)
                 try:
                     delta = chunk.choices[0].delta if getattr(chunk, "choices", None) else None
                     content = getattr(delta, "content", "") if delta else ""
@@ -128,15 +145,36 @@ class LLMProvider(LLMProviderBase):
                         yield content
         finally:
             responses.close()
+            emit_usage_event(
+                logger.bind(tag=TAG),
+                create_usage_event(
+                    usage=final_usage,
+                    model=self.model_name,
+                    provider="openai_compatible",
+                    usage_context=usage_context,
+                    payload_profile=payload_profile,
+                    latency_ms=(time.perf_counter() - started_at) * 1000,
+                    request_id=final_request_id,
+                    status=(
+                        "completed"
+                        if final_usage is not None
+                        else "usage_unavailable"
+                    ),
+                ),
+                usage_context,
+            )
 
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
         dialogue = self.normalize_dialogue(dialogue)
+        usage_context = kwargs.get("usage_context")
+        payload_profile = build_payload_profile(dialogue, functions)
 
         request_params = {
             "model": self.model_name,
             "messages": dialogue,
             "stream": True,
             "tools": functions,
+            "stream_options": {"include_usage": True},
         }
 
         optional_params = {
@@ -153,21 +191,39 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
+        started_at = time.perf_counter()
         stream = self.client.chat.completions.create(**request_params)
 
+        final_usage = None
+        final_request_id = None
         try:
             for chunk in stream:
+                usage_info = getattr(chunk, "usage", None)
+                if usage_info is not None:
+                    final_usage = usage_info
+                    final_request_id = getattr(chunk, "id", None)
                 if getattr(chunk, "choices", None):
                     delta = chunk.choices[0].delta
                     content = getattr(delta, "content", "")
                     tool_calls = getattr(delta, "tool_calls", None)
                     yield content, tool_calls
-                elif isinstance(getattr(chunk, "usage", None), CompletionUsage):
-                    usage_info = getattr(chunk, "usage", None)
-                    logger.bind(tag=TAG).info(
-                        f"Token 消耗：输入 {getattr(usage_info, 'prompt_tokens', '未知')}，"
-                        f"输出 {getattr(usage_info, 'completion_tokens', '未知')}，"
-                        f"共计 {getattr(usage_info, 'total_tokens', '未知')}"
-                    )
         finally:
             stream.close()
+            emit_usage_event(
+                logger.bind(tag=TAG),
+                create_usage_event(
+                    usage=final_usage,
+                    model=self.model_name,
+                    provider="openai_compatible",
+                    usage_context=usage_context,
+                    payload_profile=payload_profile,
+                    latency_ms=(time.perf_counter() - started_at) * 1000,
+                    request_id=final_request_id,
+                    status=(
+                        "completed"
+                        if final_usage is not None
+                        else "usage_unavailable"
+                    ),
+                ),
+                usage_context,
+            )
