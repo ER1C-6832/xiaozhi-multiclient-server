@@ -2,8 +2,10 @@
 
 ## 结论
 
-B2 已在独立分支实现为可选 ASR provider。默认 FunASR 未改变，PC 客户端
-VAD 未改变，也没有引入额外的常驻 WebSocket/HTTP ASR 服务。
+B2 已在独立分支完成主线候选化：管理后台、系统模板与源码配置的默认 ASR
+均已对齐为 `Sherpa-ONNX SenseVoice（本地增强）`。FunASR 继续启用并排在
+第二位，可随时在管理后台回滚。PC 客户端 VAD 未改变，也没有引入额外的常驻
+WebSocket/HTTP ASR 服务。
 
 B2 复用了同事方案中已被 B1 证明有效的识别侧组合：
 
@@ -30,8 +32,10 @@ B2 把与本次问题直接相关的“句内边界精修”内嵌到 Xiaozhi pr
 
 - `core/providers/asr/sherpa_sensevoice_b2.py`：新 provider。
 - `tests/test_sherpa_sensevoice_b2.py`：边界补偿单元测试。
-- `config.yaml`：源码配置模式示例，默认选择仍为 FunASR。
+- `config.yaml`：源码配置模式默认选择 B2，同时保留 FunASR 完整配置。
 - `202607231900.sql`：管理后台 provider/model 配置迁移。
+- `202607271430.sql`：将 B2 的显示名称、默认顺序和系统模板对齐为主线候选，
+  同时保留 FunASR 回滚项；不会批量覆盖已有智能体的个性化选择。
 - `db.changelog-master.yaml`：加载 B2 迁移。
 - `docs/sherpa-sensevoice-b2.md`：模型挂载、启用和回滚说明。
 
@@ -85,6 +89,26 @@ B2 把与本次问题直接相关的“句内边界精修”内嵌到 Xiaozhi pr
 - provider `fields` 与 model `config_json` 的 `JSON_VALID`：均为 1；
 - 一次性数据库无持久卷，验证后已删除。
 
+## 主线候选配置与管理端验收（2026-07-27）
+
+- 管理端镜像 `xiaozhi-web:asr-b2` 构建成功，前端和 manager-api Maven
+  构建均通过；
+- 仅重建 `xiaozhi-esp32-server-web`，MySQL、Redis 和语音服务器没有重建；
+- Liquibase 变更集 `202607271430` 已成功执行并写入
+  `DATABASECHANGELOG`；
+- `ASR_SherpaSenseVoiceB2` 已成为唯一 ASR 默认项，启用且排序为 1；
+- `ASR_FunASR` 保持启用、非默认并排序为 2；
+- 5 个系统模板已改为 B2；
+- 现有智能体 `11` 仍明确选择 `ASR_SherpaSenseVoiceB2`；
+- 管理网页前端产物包含新的 B2 默认 ID；
+- `http://192.168.1.128:8002/` 局域网访问返回 HTTP 200；
+- 部署前的相关数据库表备份位于
+  `/home/ehome/xiaozhi-server/backups/b2-web-metadata-before-deploy.sql`。
+
+模型权重仍不进入 Git。因此将 B2 合并进 `platform` 前，部署文档或 Compose
+必须明确挂载 `model.onnx`、`tokens.txt` 与 `silero_vad.onnx`；缺少模型时
+不能把源码默认值直接用于全新环境。
+
 ## 真实客户端验收（2026-07-27）
 
 管理后台已经实际选择 B2，在线日志中的 provider、输入时长、输入电平、转写和
@@ -129,5 +153,10 @@ B2 验证分支：
 B2 改善了远场语言稳定性，但不能把低信噪比录音恢复成近场质量。真实 50/100 cm
 仍有明显替换错误。B2 的定位是本地、可回滚的工程基线，不是最终宣布模型胜出。
 
-方案 C 应继续使用同一批 26 条音频和同一报告字段，具体两遍流式实现暂不在 B2
-中预设。
+基于离线 20 条、距离对照、真实 ingress 和在线客户端结果，方案 C 目前没有
+立即实施的必要。B2 已满足当前产品目标：近中场准确、远场保持可用中文、单句
+推理低于 0.3 秒，并且工程链路稳定。
+
+方案 C 保留为条件触发项：只有在扩大真实语料后持续出现长句截断、连续流式延迟
+不达标，或核心使用距离上的错误率不可接受时，才进入实现。届时继续复用同一批
+音频和报告字段，避免更换测试口径。

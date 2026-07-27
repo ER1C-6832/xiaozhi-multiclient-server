@@ -115,7 +115,7 @@ import CustomDialog from "@/components/CustomDialog.vue";
 const DEFAULT_MODEL_CONFIG = {
   ttsModelId: "TTS_EdgeTTS",
   vadModelId: "VAD_SileroVAD",
-  asrModelId: "ASR_FunASR",
+  asrModelId: "ASR_SherpaSenseVoiceB2",
   llmModelId: "LLM_ChatGLMLLM",
   vllmModelId: "VLLM_ChatGLMVLLM",
   memModelId: "Memory_nomem",
