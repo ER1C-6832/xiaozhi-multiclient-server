@@ -7,6 +7,7 @@ from google import generativeai as genai
 from google.generativeai import types, GenerationConfig
 
 from core.providers.llm.base import LLMProviderBase
+from core.providers.llm.usage import StreamUsageRecorder
 from core.utils.util import check_model_key
 from config.logger import setup_logging
 from google.generativeai.types import GenerateContentResponse
@@ -67,6 +68,8 @@ def setup_proxy_env(http_proxy: str | None, https_proxy: str | None):
 
 
 class LLMProvider(LLMProviderBase):
+    supports_usage_context = True
+
     def __init__(self, cfg: Dict[str, Any]):
         self.model_name = cfg.get("model_name", "gemini-2.0-flash")
         self.api_key = cfg["api_key"]
@@ -120,12 +123,31 @@ class LLMProvider(LLMProviderBase):
 
     # Gemini文档提到，无需维护session-id，直接用dialogue拼接而成
     def response(self, session_id, dialogue, **kwargs):
-        yield from self._generate(dialogue, None)
+        yield from self._generate(
+            dialogue, None, usage_context=kwargs.get("usage_context")
+        )
 
-    def response_with_functions(self, session_id, dialogue, functions=None):
-        yield from self._generate(dialogue, self._build_tools(functions))
+    def response_with_functions(
+        self, session_id, dialogue, functions=None, **kwargs
+    ):
+        yield from self._generate(
+            dialogue,
+            self._build_tools(functions),
+            usage_context=kwargs.get("usage_context"),
+            usage_tools=functions,
+        )
 
-    def _generate(self, dialogue, tools):
+    def _generate(
+        self, dialogue, tools, usage_context=None, usage_tools=None
+    ):
+        usage_recorder = StreamUsageRecorder(
+            logger=log.bind(tag=TAG),
+            model=self.model_name,
+            provider="gemini",
+            dialogue=dialogue,
+            tools=usage_tools,
+            usage_context=usage_context,
+        )
         role_map = {"assistant": "model", "user": "user"}
         contents: list = []
         # 拼接对话
@@ -175,6 +197,9 @@ class LLMProvider(LLMProviderBase):
 
         try:
             for chunk in stream:
+                usage_recorder.capture(chunk)
+                if not getattr(chunk, "candidates", None):
+                    continue
                 cand = chunk.candidates[0]
                 for part in cand.content.parts:
                     # a) 函数调用-通常是最后一段话才是函数调用
@@ -198,6 +223,7 @@ class LLMProvider(LLMProviderBase):
                         yield part.text if tools is None else (part.text, None)
 
         finally:
+            usage_recorder.emit()
             if tools is not None:
                 yield None, None  # function‑mode 结束，返回哑包
 

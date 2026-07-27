@@ -12,12 +12,15 @@ from cozepy import (
 )  # noqa
 from core.providers.llm.system_prompt import get_system_prompt_for_function
 from core.utils.util import check_model_key
+from core.providers.llm.usage import StreamUsageRecorder
 
 TAG = __name__
 logger = setup_logging()
 
 
 class LLMProvider(LLMProviderBase):
+    supports_usage_context = True
+
     def __init__(self, config):
         self.personal_access_token = config.get("personal_access_token")
         self.bot_id = str(config.get("bot_id"))
@@ -32,6 +35,13 @@ class LLMProvider(LLMProviderBase):
         coze_api_base = COZE_CN_BASE_URL
 
         last_msg = next(m for m in reversed(dialogue) if m["role"] == "user")
+        usage_recorder = StreamUsageRecorder(
+            logger=logger.bind(tag=TAG),
+            model="coze_bot",
+            provider="coze",
+            dialogue=[last_msg],
+            usage_context=kwargs.get("usage_context"),
+        )
 
         coze = Coze(auth=TokenAuth(token=coze_api_token), base_url=coze_api_base)
         conversation_id = self.session_conversation_map.get(session_id)
@@ -42,19 +52,25 @@ class LLMProvider(LLMProviderBase):
             conversation_id = conversation.id
             self.session_conversation_map[session_id] = conversation_id  # 更新映射
 
-        for event in coze.chat.stream(
-            bot_id=self.bot_id,
-            user_id=self.user_id,
-            additional_messages=[
-                Message.build_user_question_text(last_msg["content"]),
-            ],
-            conversation_id=conversation_id,
-        ):
-            if event.event == ChatEventType.CONVERSATION_MESSAGE_DELTA:
-                print(event.message.content, end="", flush=True)
-                yield event.message.content
+        try:
+            for event in coze.chat.stream(
+                bot_id=self.bot_id,
+                user_id=self.user_id,
+                additional_messages=[
+                    Message.build_user_question_text(last_msg["content"]),
+                ],
+                conversation_id=conversation_id,
+            ):
+                usage_recorder.capture(event)
+                if event.event == ChatEventType.CONVERSATION_MESSAGE_DELTA:
+                    print(event.message.content, end="", flush=True)
+                    yield event.message.content
+        finally:
+            usage_recorder.emit()
 
-    def response_with_functions(self, session_id, dialogue, functions=None):
+    def response_with_functions(
+        self, session_id, dialogue, functions=None, **kwargs
+    ):
         if len(dialogue) == 2 and functions is not None and len(functions) > 0:
             # 第一次调用llm， 取最后一条用户消息，附加tool提示词
             last_msg = dialogue[-1]["content"]
@@ -71,5 +87,7 @@ class LLMProvider(LLMProviderBase):
                     break
                 dialogue.pop()
 
-        for token in self.response(session_id, dialogue):
+        for token in self.response(
+            session_id, dialogue, usage_context=kwargs.get("usage_context")
+        ):
             yield token, None

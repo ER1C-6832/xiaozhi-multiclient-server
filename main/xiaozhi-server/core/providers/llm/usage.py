@@ -30,6 +30,13 @@ def _as_non_negative_int(value: Any) -> Optional[int]:
     return result if result >= 0 else None
 
 
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def normalize_provider_usage(usage: Any) -> Dict[str, Optional[int]]:
     """Map common provider/OpenAI usage shapes to one stable schema."""
     prompt_details = _read_field(
@@ -40,12 +47,26 @@ def normalize_provider_usage(usage: Any) -> Dict[str, Optional[int]]:
     )
 
     input_tokens = _as_non_negative_int(
-        _read_field(usage, "prompt_tokens", "input_tokens")
+        _read_field(
+            usage,
+            "prompt_tokens",
+            "input_tokens",
+            "prompt_token_count",
+            "prompt_eval_count",
+        )
     )
     output_tokens = _as_non_negative_int(
-        _read_field(usage, "completion_tokens", "output_tokens")
+        _read_field(
+            usage,
+            "completion_tokens",
+            "output_tokens",
+            "candidates_token_count",
+            "eval_count",
+        )
     )
-    total_tokens = _as_non_negative_int(_read_field(usage, "total_tokens"))
+    total_tokens = _as_non_negative_int(
+        _read_field(usage, "total_tokens", "total_token_count")
+    )
     if total_tokens is None and input_tokens is not None and output_tokens is not None:
         total_tokens = input_tokens + output_tokens
 
@@ -54,12 +75,71 @@ def normalize_provider_usage(usage: Any) -> Dict[str, Optional[int]]:
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "cached_input_tokens": _as_non_negative_int(
-            _read_field(prompt_details, "cached_tokens")
+            _first_not_none(
+                _read_field(
+                    usage, "cached_content_token_count", "cache_read_input_tokens"
+                ),
+                _read_field(prompt_details, "cached_tokens"),
+            )
         ),
         "reasoning_tokens": _as_non_negative_int(
-            _read_field(completion_details, "reasoning_tokens")
+            _first_not_none(
+                _read_field(usage, "thoughts_token_count"),
+                _read_field(completion_details, "reasoning_tokens"),
+            )
+        ),
+        "tool_input_tokens": _as_non_negative_int(
+            _read_field(usage, "tool_use_prompt_token_count")
         ),
     }
+
+
+_USAGE_TOKEN_FIELDS = {
+    "prompt_tokens",
+    "input_tokens",
+    "prompt_token_count",
+    "prompt_eval_count",
+    "completion_tokens",
+    "output_tokens",
+    "candidates_token_count",
+    "eval_count",
+    "total_tokens",
+    "total_token_count",
+}
+
+
+def find_usage_candidate(value: Any, max_depth: int = 5) -> Any:
+    """Find a provider usage object in common SDK/SSE wrapper shapes."""
+    seen = set()
+
+    def visit(current: Any, depth: int) -> Any:
+        if current is None or depth > max_depth:
+            return None
+        identity = id(current)
+        if identity in seen:
+            return None
+        seen.add(identity)
+
+        if isinstance(current, dict):
+            if _USAGE_TOKEN_FIELDS.intersection(current):
+                return current
+            for key in ("usage", "usage_metadata", "metadata", "data", "metrics"):
+                if key in current:
+                    found = visit(current[key], depth + 1)
+                    if found is not None:
+                        return found
+            return None
+
+        if any(hasattr(current, field) for field in _USAGE_TOKEN_FIELDS):
+            return current
+        for attr in ("usage", "usage_metadata", "metadata", "data", "metrics"):
+            if hasattr(current, attr):
+                found = visit(getattr(current, attr), depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    return visit(value, 0)
 
 
 def build_payload_profile(
@@ -122,7 +202,11 @@ def create_usage_event(
         "total_tokens": None,
         "cached_input_tokens": None,
         "reasoning_tokens": None,
+        "tool_input_tokens": None,
     }
+    has_provider_counts = any(value is not None for value in normalized.values())
+    if status == "completed" and not has_provider_counts:
+        status = "usage_unavailable"
     context = usage_context or {}
     return {
         "event": "llm_usage",
@@ -136,7 +220,7 @@ def create_usage_event(
         **normalized,
         "latency_ms": max(0, int(latency_ms)),
         "status": status,
-        "usage_source": "provider" if usage is not None else "unavailable",
+        "usage_source": "provider" if has_provider_counts else "unavailable",
         **payload_profile,
     }
 
@@ -156,6 +240,64 @@ def emit_usage_event(logger: Any, event: Dict[str, Any], usage_context=None) -> 
         TOKEN_USAGE_PREFIX
         + json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str)
     )
+
+
+class StreamUsageRecorder:
+    """Collect the final usage object from any streaming provider and emit once."""
+
+    def __init__(
+        self,
+        *,
+        logger: Any,
+        model: Optional[str],
+        provider: str,
+        dialogue: Iterable[Dict[str, Any]],
+        tools: Optional[Iterable[Dict[str, Any]]] = None,
+        usage_context: Optional[Dict[str, Any]] = None,
+    ):
+        self.logger = logger
+        self.model = model
+        self.provider = provider
+        self.usage_context = usage_context
+        self.payload_profile = build_payload_profile(dialogue, tools)
+        self.started_at = time.perf_counter()
+        self.final_usage = None
+        self.request_id = None
+        self._emitted = False
+
+    def capture(
+        self, value: Any, request_id: Optional[str] = None
+    ) -> Any:
+        usage = find_usage_candidate(value)
+        if usage is not None:
+            self.final_usage = usage
+        if request_id:
+            self.request_id = str(request_id)
+        elif value is not None:
+            candidate_id = _read_field(value, "request_id", "id")
+            if candidate_id:
+                self.request_id = str(candidate_id)
+        return usage
+
+    def emit(self, status: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if self._emitted:
+            return None
+        self._emitted = True
+        resolved_status = status or (
+            "completed" if self.final_usage is not None else "usage_unavailable"
+        )
+        event = create_usage_event(
+            usage=self.final_usage,
+            model=self.model,
+            provider=self.provider,
+            usage_context=self.usage_context,
+            payload_profile=self.payload_profile,
+            latency_ms=(time.perf_counter() - self.started_at) * 1000,
+            request_id=self.request_id,
+            status=resolved_status,
+        )
+        emit_usage_event(self.logger, event, self.usage_context)
+        return event
 
 
 class LLMUsageTurnTracker:
@@ -275,6 +417,7 @@ class LLMUsageTurnTracker:
             "total_tokens": total("total_tokens"),
             "cached_input_tokens": total("cached_input_tokens"),
             "reasoning_tokens": total("reasoning_tokens"),
+            "tool_input_tokens": total("tool_input_tokens"),
             "duration_ms": max(
                 0, int((time.perf_counter() - self.started_at) * 1000)
             ),

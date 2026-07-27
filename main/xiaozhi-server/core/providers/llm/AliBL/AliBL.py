@@ -3,6 +3,7 @@ from http import HTTPStatus
 import dashscope
 from dashscope import Application
 from core.providers.llm.base import LLMProviderBase
+from core.providers.llm.usage import StreamUsageRecorder
 from core.utils.util import check_model_key
 import time
 
@@ -11,6 +12,8 @@ logger = setup_logging()
 
 
 class LLMProvider(LLMProviderBase):
+    supports_usage_context = True
+
     def __init__(self, config):
         self.api_key = config["api_key"]
         self.app_id = config["app_id"]
@@ -20,7 +23,7 @@ class LLMProvider(LLMProviderBase):
         self.streaming_chunk_size = config.get("streaming_chunk_size", 3)  # 每次流式返回的字符数
         check_model_key("AliBLLLM", self.api_key)
 
-    def response(self, session_id, dialogue):
+    def response(self, session_id, dialogue, **kwargs):
         # 处理dialogue
         if self.is_No_prompt:
             dialogue.pop(0)
@@ -50,6 +53,13 @@ class LLMProvider(LLMProviderBase):
         if self.base_url and ("/api/" in self.base_url):
             dashscope.base_http_api_url = self.base_url
 
+        usage_recorder = StreamUsageRecorder(
+            logger=logger.bind(tag=TAG),
+            model="dashscope_application",
+            provider="dashscope_application",
+            dialogue=dialogue,
+            usage_context=kwargs.get("usage_context"),
+        )
         responses = Application.call(**call_params)
 
         # 流式处理（SDK在stream=True时返回可迭代对象；否则返回单次响应对象）
@@ -60,6 +70,7 @@ class LLMProvider(LLMProviderBase):
         last_text = ""
         try:
             for resp in responses:
+                usage_recorder.capture(resp)
                 if resp.status_code != HTTPStatus.OK:
                     logger.bind(tag=TAG).error(
                         f"code={resp.status_code}, message={resp.message}, 请参考文档：https://help.aliyun.com/zh/model-studio/developer-reference/error-code"
@@ -85,6 +96,7 @@ class LLMProvider(LLMProviderBase):
                 )
                 yield "【阿里百练API服务响应异常】"
             else:
+                usage_recorder.capture(responses)
                 full_text = getattr(getattr(responses, "output", None), "text", "")
                 logger.bind(tag=TAG).info(
                     f"【阿里百练API服务】完整响应长度: {len(full_text)}"
@@ -93,12 +105,18 @@ class LLMProvider(LLMProviderBase):
                     chunk = full_text[i:i + self.streaming_chunk_size]
                     if chunk:
                         yield chunk
+        finally:
+            usage_recorder.emit()
 
-    def response_with_functions(self, session_id, dialogue, functions=None):
+    def response_with_functions(
+        self, session_id, dialogue, functions=None, **kwargs
+    ):
         # 阿里百练当前未支持原生的 function call。为保持兼容，这里回退到普通文本流式输出。
         # 上层会按 (content, tool_calls) 的形式消费，这里始终返回 (token, None)
         logger.bind(tag=TAG).warning(
             "阿里百练未实现原生 function call，已回退为纯文本流式输出"
         )
-        for token in self.response(session_id, dialogue):
+        for token in self.response(
+            session_id, dialogue, usage_context=kwargs.get("usage_context")
+        ):
             yield token, None

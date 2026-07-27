@@ -4,12 +4,15 @@ import requests
 from core.providers.llm.base import LLMProviderBase
 from core.providers.llm.system_prompt import get_system_prompt_for_function
 from core.utils.util import check_model_key
+from core.providers.llm.usage import StreamUsageRecorder
 
 TAG = __name__
 logger = setup_logging()
 
 
 class LLMProvider(LLMProviderBase):
+    supports_usage_context = True
+
     def __init__(self, config):
         self.api_key = config["api_key"]
         self.mode = config.get("mode", "chat-messages")
@@ -23,6 +26,13 @@ class LLMProvider(LLMProviderBase):
         # 取最后一条用户消息
         last_msg = next(m for m in reversed(dialogue) if m["role"] == "user")
         conversation_id = self.session_conversation_map.get(session_id)
+        usage_recorder = StreamUsageRecorder(
+            logger=logger.bind(tag=TAG),
+            model="dify_application",
+            provider="dify",
+            dialogue=[last_msg],
+            usage_context=kwargs.get("usage_context"),
+        )
 
         # 发起流式请求
         if self.mode == "chat-messages":
@@ -46,16 +56,19 @@ class LLMProvider(LLMProviderBase):
                 "user": session_id,
             }
 
-        with requests.post(
-            f"{self.base_url}/{self.mode}",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=request_json,
-            stream=True,
-        ) as r:
-            if self.mode == "chat-messages":
-                for line in r.iter_lines():
-                    if line.startswith(b"data: "):
+        try:
+            with requests.post(
+                f"{self.base_url}/{self.mode}",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=request_json,
+                stream=True,
+            ) as r:
+                if self.mode == "chat-messages":
+                    for line in r.iter_lines():
+                        if not line.startswith(b"data: "):
+                            continue
                         event = json.loads(line[6:])
+                        usage_recorder.capture(event)
                         # 如果没有找到conversation_id，则获取此次conversation_id
                         if not conversation_id:
                             conversation_id = event.get("conversation_id")
@@ -63,30 +76,40 @@ class LLMProvider(LLMProviderBase):
                                 conversation_id  # 更新映射
                             )
                         # 过滤 message_replace 事件，此事件会全量推一次
-                        if event.get("event") != "message_replace" and event.get(
-                            "answer"
+                        if (
+                            event.get("event") != "message_replace"
+                            and event.get("answer")
                         ):
                             yield event["answer"]
-            elif self.mode == "workflows/run":
-                for line in r.iter_lines():
-                    if line.startswith(b"data: "):
+                elif self.mode == "workflows/run":
+                    for line in r.iter_lines():
+                        if not line.startswith(b"data: "):
+                            continue
                         event = json.loads(line[6:])
+                        usage_recorder.capture(event)
                         if event.get("event") == "workflow_finished":
                             if event["data"]["status"] == "succeeded":
                                 yield event["data"]["outputs"]["answer"]
                             else:
                                 yield "【服务响应异常】"
-            elif self.mode == "completion-messages":
-                for line in r.iter_lines():
-                    if line.startswith(b"data: "):
+                elif self.mode == "completion-messages":
+                    for line in r.iter_lines():
+                        if not line.startswith(b"data: "):
+                            continue
                         event = json.loads(line[6:])
+                        usage_recorder.capture(event)
                         # 过滤 message_replace 事件，此事件会全量推一次
                         if event.get("event") != "message_replace" and event.get(
                             "answer"
                         ):
                             yield event["answer"]
 
-    def response_with_functions(self, session_id, dialogue, functions=None):
+        finally:
+            usage_recorder.emit()
+
+    def response_with_functions(
+        self, session_id, dialogue, functions=None, **kwargs
+    ):
         if len(dialogue) == 2 and functions is not None and len(functions) > 0:
             # 第一次调用llm， 取最后一条用户消息，附加tool提示词
             last_msg = dialogue[-1]["content"]
@@ -103,5 +126,7 @@ class LLMProvider(LLMProviderBase):
                     break
                 dialogue.pop()
 
-        for token in self.response(session_id, dialogue):
+        for token in self.response(
+            session_id, dialogue, usage_context=kwargs.get("usage_context")
+        ):
             yield token, None

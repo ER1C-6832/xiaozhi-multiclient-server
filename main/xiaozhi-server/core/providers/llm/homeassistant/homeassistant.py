@@ -2,12 +2,15 @@ import requests
 from requests.exceptions import RequestException
 from config.logger import setup_logging
 from core.providers.llm.base import LLMProviderBase
+from core.providers.llm.usage import StreamUsageRecorder
 
 TAG = __name__
 logger = setup_logging()
 
 
 class LLMProvider(LLMProviderBase):
+    supports_usage_context = True
+
     def __init__(self, config):
         self.agent_id = config.get("agent_id")  # 对应 agent_id
         self.api_key = config.get("api_key")
@@ -32,6 +35,13 @@ class LLMProvider(LLMProviderBase):
             "agent_id": self.agent_id,
             "conversation_id": session_id,  # 使用 session_id 作为 conversation_id
         }
+        usage_recorder = StreamUsageRecorder(
+            logger=logger.bind(tag=TAG),
+            model="homeassistant_conversation",
+            provider="homeassistant",
+            dialogue=[{"role": "user", "content": input_text or ""}],
+            usage_context=kwargs.get("usage_context"),
+        )
         # 设置请求头
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -39,12 +49,16 @@ class LLMProvider(LLMProviderBase):
         }
 
         # 发起 POST 请求
-        with requests.post(self.api_url, json=payload, headers=headers) as response:
-            # 检查请求是否成功
-            response.raise_for_status()
+        try:
+            with requests.post(self.api_url, json=payload, headers=headers) as response:
+                # 检查请求是否成功
+                response.raise_for_status()
 
-            # 解析返回数据
-            data = response.json()
+                # 解析返回数据
+                data = response.json()
+                usage_recorder.capture(data)
+        finally:
+            usage_recorder.emit()
         speech = (
             data.get("response", {})
             .get("speech", {})
@@ -58,7 +72,11 @@ class LLMProvider(LLMProviderBase):
         else:
             logger.bind(tag=TAG).warning("API 返回数据中没有 speech 内容")
 
-    def response_with_functions(self, session_id, dialogue, functions=None):
+    def response_with_functions(
+        self, session_id, dialogue, functions=None, **kwargs
+    ):
         logger.bind(tag=TAG).error(
             f"homeassistant不支持（function call），建议使用其他意图识别"
         )
+        if False:
+            yield None, None

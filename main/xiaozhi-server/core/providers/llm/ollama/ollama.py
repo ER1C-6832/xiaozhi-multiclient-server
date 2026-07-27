@@ -2,12 +2,15 @@ from config.logger import setup_logging
 from openai import OpenAI
 import json
 from core.providers.llm.base import LLMProviderBase
+from core.providers.llm.usage import StreamUsageRecorder
 
 TAG = __name__
 logger = setup_logging()
 
 
 class LLMProvider(LLMProviderBase):
+    supports_usage_context = True
+
     def __init__(self, config):
         self.model_name = config.get("model_name")
         self.base_url = config.get("base_url", "http://localhost:11434")
@@ -43,8 +46,18 @@ class LLMProvider(LLMProviderBase):
             # 使用修改后的对话
             dialogue = dialogue_copy
 
+        usage_recorder = StreamUsageRecorder(
+            logger=logger.bind(tag=TAG),
+            model=self.model_name,
+            provider="ollama",
+            dialogue=dialogue,
+            usage_context=kwargs.get("usage_context"),
+        )
         responses = self.client.chat.completions.create(
-            model=self.model_name, messages=dialogue, stream=True
+            model=self.model_name,
+            messages=dialogue,
+            stream=True,
+            stream_options={"include_usage": True},
         )
         is_active = True
         # 用于处理跨chunk的标签
@@ -52,6 +65,7 @@ class LLMProvider(LLMProviderBase):
 
         try:
             for chunk in responses:
+                usage_recorder.capture(chunk)
                 try:
                     delta = (
                         chunk.choices[0].delta
@@ -90,8 +104,11 @@ class LLMProvider(LLMProviderBase):
                     logger.bind(tag=TAG).error(f"Error processing chunk: {e}")
         finally:
             responses.close()
+            usage_recorder.emit()
 
-    def response_with_functions(self, session_id, dialogue, functions=None):
+    def response_with_functions(
+        self, session_id, dialogue, functions=None, **kwargs
+    ):
         # 如果是qwen3模型，在用户最后一条消息中添加/no_think指令
         if self.is_qwen3:
             # 复制对话列表，避免修改原始对话
@@ -110,11 +127,20 @@ class LLMProvider(LLMProviderBase):
             # 使用修改后的对话
             dialogue = dialogue_copy
 
+        usage_recorder = StreamUsageRecorder(
+            logger=logger.bind(tag=TAG),
+            model=self.model_name,
+            provider="ollama",
+            dialogue=dialogue,
+            tools=functions,
+            usage_context=kwargs.get("usage_context"),
+        )
         stream = self.client.chat.completions.create(
             model=self.model_name,
             messages=dialogue,
             stream=True,
             tools=functions,
+            stream_options={"include_usage": True},
         )
 
         is_active = True
@@ -122,6 +148,7 @@ class LLMProvider(LLMProviderBase):
 
         try:
             for chunk in stream:
+                usage_recorder.capture(chunk)
                 try:
                     delta = (
                         chunk.choices[0].delta
@@ -169,3 +196,4 @@ class LLMProvider(LLMProviderBase):
                     continue
         finally:
             stream.close()
+            usage_recorder.emit()

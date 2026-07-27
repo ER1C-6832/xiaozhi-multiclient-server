@@ -44,6 +44,7 @@ class LLMUsageTest(unittest.TestCase):
                 "total_tokens": 150,
                 "cached_input_tokens": 80,
                 "reasoning_tokens": 12,
+                "tool_input_tokens": None,
             },
         )
 
@@ -58,8 +59,98 @@ class LLMUsageTest(unittest.TestCase):
                 "total_tokens": 13,
                 "cached_input_tokens": None,
                 "reasoning_tokens": None,
+                "tool_input_tokens": None,
             },
         )
+
+    def test_normalizes_gemini_usage_metadata(self):
+        usage = SimpleNamespace(
+            prompt_token_count=21,
+            candidates_token_count=7,
+            total_token_count=31,
+            cached_content_token_count=0,
+            thoughts_token_count=3,
+            tool_use_prompt_token_count=2,
+        )
+
+        self.assertEqual(
+            MODULE.normalize_provider_usage(usage),
+            {
+                "input_tokens": 21,
+                "output_tokens": 7,
+                "total_tokens": 31,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 3,
+                "tool_input_tokens": 2,
+            },
+        )
+
+    def test_finds_nested_sse_usage(self):
+        payload = {
+            "event": "message_end",
+            "metadata": {
+                "usage": {
+                    "prompt_tokens": 19,
+                    "completion_tokens": 4,
+                    "total_tokens": 23,
+                }
+            },
+        }
+
+        usage = MODULE.find_usage_candidate(payload)
+        self.assertEqual(usage["total_tokens"], 23)
+
+    def test_negative_provider_counts_are_unknown(self):
+        normalized = MODULE.normalize_provider_usage(
+            {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
+        )
+        self.assertIsNone(normalized["input_tokens"])
+        self.assertIsNone(normalized["output_tokens"])
+        self.assertIsNone(normalized["total_tokens"])
+
+        event = MODULE.create_usage_event(
+            usage={
+                "prompt_tokens": -1,
+                "completion_tokens": -1,
+                "total_tokens": -1,
+            },
+            model="xinference-test",
+            provider="xinference",
+            usage_context=None,
+            payload_profile={},
+            latency_ms=1,
+        )
+        self.assertEqual(event["usage_source"], "unavailable")
+        self.assertEqual(event["status"], "usage_unavailable")
+
+    def test_stream_recorder_emits_exactly_once(self):
+        logger = CapturingLogger()
+        recorded = []
+        recorder = MODULE.StreamUsageRecorder(
+            logger=logger,
+            model="test-model",
+            provider="test-provider",
+            dialogue=[{"role": "user", "content": "do not log me"}],
+            usage_context={"record_usage": recorded.append},
+        )
+        recorder.capture(
+            SimpleNamespace(
+                id="request-1",
+                usage=SimpleNamespace(
+                    prompt_tokens=10,
+                    completion_tokens=2,
+                    total_tokens=12,
+                ),
+            )
+        )
+
+        first = recorder.emit()
+        second = recorder.emit()
+
+        self.assertEqual(first["request_id"], "request-1")
+        self.assertEqual(first["total_tokens"], 12)
+        self.assertIsNone(second)
+        self.assertEqual(len(recorded), 1)
 
     def test_payload_profile_records_sizes_not_contents(self):
         profile = MODULE.build_payload_profile(
