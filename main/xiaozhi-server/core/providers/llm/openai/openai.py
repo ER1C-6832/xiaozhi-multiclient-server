@@ -1,9 +1,9 @@
-import httpx
 import openai
 from openai.types import CompletionUsage
 from config.logger import setup_logging
 from core.utils.util import check_model_key
 from core.providers.llm.base import LLMProviderBase
+from core.providers.llm.openai.client_config import build_openai_transport_config
 from urllib.parse import urlparse
 
 TAG = __name__
@@ -27,21 +27,7 @@ class LLMProvider(LLMProviderBase):
         else:
             self.base_url = config.get("url")
         
-        timeout_config = config.get("timeout")
-        if isinstance(timeout_config, dict):
-            # 细粒度超时配置
-            custom_timeout = httpx.Timeout(
-                pool=timeout_config.get("pool", 2.0),
-                connect=timeout_config.get("connect", 3.0),
-                write=timeout_config.get("write", 5.0),
-                read=timeout_config.get("read", 60.0)
-            )
-        elif isinstance(timeout_config, (int, float)) and timeout_config > 0:
-            # 兼容旧的单一超时配置（整数或浮点数）
-            custom_timeout = httpx.Timeout(timeout_config)
-        else:
-            # 未配置或配置无效，使用默认值
-            custom_timeout = httpx.Timeout(300)
+        transport_config = build_openai_transport_config(config)
 
         param_defaults = {
             "max_tokens": int,
@@ -68,7 +54,16 @@ class LLMProvider(LLMProviderBase):
         model_key_msg = check_model_key("LLM", self.api_key)
         if model_key_msg:
             logger.bind(tag=TAG).error(model_key_msg)
-        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=custom_timeout)
+        self.client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=transport_config.timeout,
+            max_retries=transport_config.max_retries,
+        )
+        logger.bind(tag=TAG).info(
+            f"LLM transport: timeout={transport_config.timeout}, "
+            f"max_retries={transport_config.max_retries}"
+        )
 
     @staticmethod
     def normalize_dialogue(dialogue):

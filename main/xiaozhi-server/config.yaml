@@ -680,6 +680,10 @@ LLM:
     model_name: glm-4-flash
     url: https://open.bigmodel.cn/api/paas/v4/
     api_key: 你的chat-glm web key
+    # 语音交互优先快速失败；认证错误重试没有意义。
+    timeout: 15
+    # 如确需重试瞬时网络错误可设为1；默认0避免一轮卡住几十秒。
+    max_retries: 0
   OllamaLLM:
     # 定义LLM API类型
     type: ollama
