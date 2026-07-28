@@ -1104,10 +1104,61 @@ class ConnectionHandler:
             re.search(
                 r"删除|删掉|移除|恢复|还原|找回|追加|补充|补一句|"
                 r"修改|改内容|改正文|改标题|替换|覆盖|置顶|取消置顶|"
-                r"绑定标签|换标签|删除标签",
+                r"绑定标签|换标签|删除标签|读取|读一下|打开.{0,8}便签",
                 query or "",
             )
         )
+
+    @staticmethod
+    def _tool_function_name(tool):
+        if not isinstance(tool, dict):
+            return ""
+        function = tool.get("function")
+        return str(function.get("name") or "") if isinstance(function, dict) else ""
+
+    def _tool_functions_for_depth(self, depth):
+        candidates = list(self._active_tool_route.candidates)
+        if not getattr(self, "_allow_tool_followup", False):
+            return candidates
+        id_consuming = {
+            "notes_get",
+            "notes_append",
+            "notes_update_title",
+            "notes_replace_content",
+            "notes_convert_type",
+            "notes_pin",
+            "notes_delete",
+            "notes_restore",
+            "tags_bind",
+            "ui_open_note",
+        }
+        if not any(
+            self._tool_function_name(tool) in id_consuming
+            for tool in candidates
+        ):
+            return candidates
+
+        provenance = getattr(self, "_mcp_target_provenance", {})
+        has_resolved_target = any(
+            source == "resolved" for source in provenance.values()
+        )
+        if depth == 0 and not has_resolved_target:
+            # Never expose raw ID-consuming tools on the first model call.
+            # Force a unique title resolver first, regardless of model quality.
+            available = list(self.func_handler.get_functions() or [])
+            return [
+                tool
+                for tool in available
+                if self._tool_function_name(tool) == "notes_resolve"
+            ]
+        if depth == 1:
+            return [
+                tool
+                for tool in candidates
+                if self._tool_function_name(tool)
+                not in {"notes_resolve", "notes_search"}
+            ]
+        return candidates
 
     def _compact_dialogue(self):
         routing_config = self.config.get("tool_routing", {})
@@ -1249,6 +1300,8 @@ class ConnectionHandler:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self._active_tool_route = self._select_tool_route(query)
+            if self._active_tool_route.reason != "tool_parameter_continuation":
+                self._mcp_target_provenance = {}
             self._allow_tool_followup = (
                 self._active_tool_route.route == "tool"
                 and self._requires_multi_step_tool_chain(query)
@@ -1301,7 +1354,9 @@ class ConnectionHandler:
                 and getattr(self, "_active_tool_route", None) is not None
                 and self._active_tool_route.route == "tool"
         ):
-            functions = list(self._active_tool_route.candidates)
+            functions = self._tool_functions_for_depth(depth)
+            if not functions:
+                functions = None
 
         response_message = []
 

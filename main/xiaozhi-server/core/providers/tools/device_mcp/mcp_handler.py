@@ -28,18 +28,23 @@ def normalize_device_tool_arguments(tool_name: str, arguments: dict) -> dict:
             normalized["limit"] = max(5, min(10, int(normalized.get("limit", 10))))
         except (TypeError, ValueError):
             normalized["limit"] = 10
-    elif tool_name == "notes.resolve" and "exact_title" not in normalized:
-        query = str(normalized.get("query", "")).strip()
-        match = re.fullmatch(r"标题(?:是|叫|写)?\s*[：:]?\s*(.+)", query)
-        if match:
-            exact_title = re.sub(
-                r"的(?:那条|那个|便签)$", "", match.group(1).strip()
-            ).strip()
-        else:
-            exact_title = ""
+    elif tool_name == "notes.resolve":
+        exact_title = str(normalized.get("exact_title", "")).strip()
         if exact_title:
+            # The client schema uses oneOf: query and exact_title are mutually
+            # exclusive. Providers sometimes emit both, so exact_title wins.
             normalized.pop("query", None)
             normalized["exact_title"] = exact_title
+        else:
+            query = str(normalized.get("query", "")).strip()
+            match = re.fullmatch(r"标题(?:是|叫|写|为)?\s*[：:]?\s*(.+)", query)
+            if match:
+                exact_title = re.sub(
+                    r"的(?:那条|那个|便签)$", "", match.group(1).strip()
+                ).strip()
+            if exact_title:
+                normalized.pop("query", None)
+                normalized["exact_title"] = exact_title
     return normalized
 
 

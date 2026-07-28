@@ -99,6 +99,95 @@ def test_model_arguments_are_normalized_for_safe_note_lookup():
     assert mcp_handler.normalize_device_tool_arguments(
         "notes.resolve", {"query": "标题3的那条"}
     ) == {"exact_title": "3"}
+    assert mcp_handler.normalize_device_tool_arguments(
+        "notes.resolve", {"query": "3", "exact_title": "3"}
+    ) == {"exact_title": "3"}
+    assert mcp_handler.normalize_device_tool_arguments(
+        "notes.resolve", {"query": "标题为3"}
+    ) == {"exact_title": "3"}
+
+
+def test_direct_spoken_number_cannot_be_used_as_internal_mutation_id(monkeypatch):
+    calls = []
+
+    async def must_not_call(*args, **_kwargs):
+        calls.append(args)
+        raise AssertionError("untrusted mutation reached the client")
+
+    async def scenario():
+        conn = make_connection()
+        await conn.mcp_client.set_ready(True)
+        monkeypatch.setattr(
+            "core.providers.tools.device_mcp.mcp_executor.call_mcp_tool",
+            must_not_call,
+        )
+        response = await DeviceMCPExecutor(conn).execute(
+            conn, "notes_delete", {"note_ids": [3]}
+        )
+        assert response.action == Action.RESPONSE
+        assert "尚未按便签标题唯一定位" in response.response
+        assert calls == []
+
+    asyncio.run(scenario())
+
+
+def test_only_unique_resolver_output_authorizes_followup_mutation(monkeypatch):
+    calls = []
+
+    async def resolve_then_delete(_conn, _client, tool_name, args, **_kwargs):
+        calls.append((tool_name, json.loads(args)))
+        if tool_name == "notes_resolve":
+            return json.dumps(
+                {
+                    "status": "success",
+                    "message": "目标已唯一定位",
+                    "affected_note_ids": [7],
+                    "result": {
+                        "resolution_status": "resolved",
+                        "note_id": 7,
+                        "title": "3",
+                    },
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "status": "requires_confirmation",
+                "message": "删除便签需要确认",
+                "requires_confirmation": True,
+                "confirmation_id": "confirm-title-3",
+            },
+            ensure_ascii=False,
+        )
+
+    async def scenario():
+        conn = make_connection()
+        await conn.mcp_client.set_ready(True)
+        monkeypatch.setattr(
+            "core.providers.tools.device_mcp.mcp_executor.call_mcp_tool",
+            resolve_then_delete,
+        )
+        executor = DeviceMCPExecutor(conn)
+        resolved = await executor.execute(
+            conn, "notes_resolve", {"exact_title": "3"}
+        )
+        assert resolved.action == Action.REQLLM
+        assert conn._mcp_target_provenance == {7: "resolved"}
+
+        wrong = await executor.execute(conn, "notes_delete", {"note_ids": [3]})
+        assert wrong.action == Action.RESPONSE
+        assert "尚未按便签标题唯一定位" in wrong.response
+
+        pending = await executor.execute(conn, "notes_delete", {"note_ids": [7]})
+        assert pending.action == Action.RESPONSE
+        assert "删除便签需要确认" in pending.response
+        assert conn._mcp_target_provenance == {}
+        assert calls == [
+            ("notes_resolve", {"exact_title": "3"}),
+            ("notes_delete", {"note_ids": [7]}),
+        ]
+
+    asyncio.run(scenario())
 
 
 def test_structured_business_failure_keeps_public_message(monkeypatch):
@@ -208,6 +297,7 @@ def test_pending_mutation_opens_confirmation_card(monkeypatch):
 
     async def scenario():
         conn = make_connection()
+        conn._mcp_target_provenance = {7: "resolved"}
         await conn.mcp_client.set_ready(True)
         await conn.mcp_client.add_tool(
             {

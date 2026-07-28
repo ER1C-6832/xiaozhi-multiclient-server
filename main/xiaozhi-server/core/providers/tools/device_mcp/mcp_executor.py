@@ -28,6 +28,56 @@ _MUTATING_TOOLS = {
     "assistant_reject",
 }
 
+_ID_MUTATING_TOOLS = {
+    "notes_append",
+    "notes_update_title",
+    "notes_replace_content",
+    "notes_convert_type",
+    "notes_pin",
+    "notes_delete",
+    "notes_restore",
+    "tags_bind",
+}
+_ID_READ_TOOLS = {"notes_get", "ui_open_note"}
+_ID_CONSUMING_TOOLS = _ID_MUTATING_TOOLS | _ID_READ_TOOLS
+_TARGET_PRODUCER_TOOLS = {
+    "notes_resolve",
+    "notes_search",
+    "notes_list_recent",
+    "notes_list_by_tag",
+    "notes_list_deleted",
+    "notes_list_todos",
+    "notes_list_pinned",
+    "notes_create",
+}
+
+
+def _requested_note_ids(arguments: Dict[str, Any]) -> set[int]:
+    values = []
+    if "note_id" in arguments:
+        values.append(arguments.get("note_id"))
+    note_ids = arguments.get("note_ids")
+    if isinstance(note_ids, list):
+        values.extend(note_ids)
+    result = set()
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        try:
+            note_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if note_id > 0:
+            result.add(note_id)
+    return result
+
+
+def _affected_note_ids(payload: dict) -> set[int]:
+    values = payload.get("affected_note_ids")
+    if not isinstance(values, list):
+        return set()
+    return _requested_note_ids({"note_ids": values})
+
 
 def _candidate_titles(payload: dict) -> list[str]:
     result = payload.get("result")
@@ -62,6 +112,30 @@ class DeviceMCPExecutor(ToolExecutor):
                 action=Action.ERROR,
                 response="设备端MCP客户端未准备就绪",
             )
+
+        requested_ids = _requested_note_ids(arguments)
+        if tool_name in _ID_CONSUMING_TOOLS:
+            provenance = getattr(conn, "_mcp_target_provenance", {})
+            required_source = (
+                "resolved" if tool_name in _ID_MUTATING_TOOLS else "readable"
+            )
+            unauthorized = {
+                note_id
+                for note_id in requested_ids
+                if provenance.get(note_id) not in {required_source, "resolved"}
+            }
+            if not requested_ids or unauthorized:
+                logger.bind(tag=TAG).warning(
+                    "Blocked untrusted note-id tool call: "
+                    f"tool={tool_name}, requested={sorted(requested_ids)}, "
+                    f"unauthorized={sorted(unauthorized)}"
+                )
+                return ActionResponse(
+                    action=Action.RESPONSE,
+                    response=(
+                        "未执行：目标尚未按便签标题唯一定位，请先按标题查找。"
+                    ),
+                )
 
         try:
             # 转换参数为JSON字符串
@@ -98,7 +172,27 @@ class DeviceMCPExecutor(ToolExecutor):
                 )
                 result_payload = resultJson.get("result")
 
+                if status == "success" and tool_name in _TARGET_PRODUCER_TOOLS:
+                    affected_ids = _affected_note_ids(resultJson)
+                    if affected_ids:
+                        provenance = dict(
+                            getattr(conn, "_mcp_target_provenance", {})
+                        )
+                        source = (
+                            "resolved"
+                            if tool_name == "notes_resolve"
+                            and isinstance(result_payload, dict)
+                            and result_payload.get("resolution_status") != "ambiguous"
+                            and len(affected_ids) == 1
+                            else "readable"
+                        )
+                        for note_id in affected_ids:
+                            provenance[note_id] = source
+                        conn._mcp_target_provenance = provenance
+
                 if requires_confirmation or status == "requires_confirmation":
+                    if tool_name in _ID_MUTATING_TOOLS:
+                        conn._mcp_target_provenance = {}
                     confirmation_id = str(
                         resultJson.get("confirmation_id") or ""
                     ).strip()
@@ -148,6 +242,8 @@ class DeviceMCPExecutor(ToolExecutor):
                             ),
                         )
                 if status == "success" and tool_name in _MUTATING_TOOLS:
+                    if tool_name in _ID_MUTATING_TOOLS:
+                        conn._mcp_target_provenance = {}
                     return ActionResponse(
                         action=Action.RESPONSE,
                         response=message or "设备工具操作已完成。",
