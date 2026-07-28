@@ -19,6 +19,9 @@ DEFAULT_TOKEN_BUDGET = {
     "max_output_tokens_per_request": 200,
     "warn_at_percent": 80,
     "client_telemetry": True,
+    "max_tools_per_request": 8,
+    "max_tool_schema_chars_per_request": 6_000,
+    "max_message_chars_per_request": 8_000,
 }
 
 CLIENT_USAGE_FIELDS = (
@@ -45,6 +48,15 @@ CLIENT_USAGE_FIELDS = (
     "max_output_tokens_per_request",
     "warn_at_percent",
     "output_cap_enforced",
+    "budget_profile",
+    "request_route",
+    "routing_reason",
+    "available_tool_count",
+    "selected_tool_count",
+    "selected_tool_schema_chars",
+    "max_tools_per_request",
+    "max_tool_schema_chars_per_request",
+    "max_message_chars_per_request",
 )
 
 
@@ -374,6 +386,8 @@ class LLMUsageTurnTracker:
         budget_config: Optional[Dict[str, Any]] = None,
         summary_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         output_cap_enforced: bool = False,
+        budget_profile: str = "default",
+        route_metadata: Optional[Dict[str, Any]] = None,
     ):
         self.logger = logger
         self.turn_id = turn_id
@@ -382,6 +396,11 @@ class LLMUsageTurnTracker:
         self.started_at = time.perf_counter()
         configured_budget = dict(DEFAULT_TOKEN_BUDGET)
         configured_budget.update(budget_config or {})
+        profiles = configured_budget.get("profiles") or {}
+        profile_config = profiles.get(budget_profile) or {}
+        configured_budget.update(profile_config)
+        self.budget_profile = budget_profile
+        self.route_metadata = dict(route_metadata or {})
         self.budget = {
             "enabled": bool(configured_budget["enabled"]),
             "max_total_tokens_per_turn": self._positive_int(
@@ -392,7 +411,7 @@ class LLMUsageTurnTracker:
                 configured_budget["max_llm_calls_per_turn"],
                 DEFAULT_TOKEN_BUDGET["max_llm_calls_per_turn"],
             ),
-            "max_tool_calls_per_turn": self._positive_int(
+            "max_tool_calls_per_turn": self._non_negative_int(
                 configured_budget["max_tool_calls_per_turn"],
                 DEFAULT_TOKEN_BUDGET["max_tool_calls_per_turn"],
             ),
@@ -408,6 +427,18 @@ class LLMUsageTurnTracker:
                 ),
             ),
             "client_telemetry": bool(configured_budget["client_telemetry"]),
+            "max_tools_per_request": self._non_negative_int(
+                configured_budget["max_tools_per_request"],
+                DEFAULT_TOKEN_BUDGET["max_tools_per_request"],
+            ),
+            "max_tool_schema_chars_per_request": self._non_negative_int(
+                configured_budget["max_tool_schema_chars_per_request"],
+                DEFAULT_TOKEN_BUDGET["max_tool_schema_chars_per_request"],
+            ),
+            "max_message_chars_per_request": self._positive_int(
+                configured_budget["max_message_chars_per_request"],
+                DEFAULT_TOKEN_BUDGET["max_message_chars_per_request"],
+            ),
         }
         self.summary_callback = summary_callback
         self.output_cap_enforced = bool(output_cap_enforced)
@@ -418,11 +449,17 @@ class LLMUsageTurnTracker:
         self._finished = False
         self._budget_status = "disabled" if not self.budget["enabled"] else "within_budget"
         self._budget_reason = None
+        self._last_payload_profile = {}
 
     @staticmethod
     def _positive_int(value: Any, default: int) -> int:
         normalized = _as_non_negative_int(value)
         return normalized if normalized is not None and normalized > 0 else default
+
+    @staticmethod
+    def _non_negative_int(value: Any, default: int) -> int:
+        normalized = _as_non_negative_int(value)
+        return normalized if normalized is not None else default
 
     def _known_total_tokens_locked(self) -> int:
         return sum(
@@ -451,6 +488,8 @@ class LLMUsageTurnTracker:
             "turn_id": self.turn_id,
             "session_id": self.session_id,
             "model": self.model,
+            "budget_profile": self.budget_profile,
+            **self.route_metadata,
             "enabled": self.budget["enabled"],
             "action": action,
             "status": status,
@@ -469,6 +508,9 @@ class LLMUsageTurnTracker:
                     "max_tool_calls_per_turn",
                     "max_output_tokens_per_request",
                     "warn_at_percent",
+                    "max_tools_per_request",
+                    "max_tool_schema_chars_per_request",
+                    "max_message_chars_per_request",
                 )
             },
         }
@@ -478,6 +520,61 @@ class LLMUsageTurnTracker:
             TOKEN_BUDGET_PREFIX
             + json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str)
         )
+
+    def authorize_payload(
+        self,
+        dialogue: Iterable[Dict[str, Any]],
+        tools: Optional[Iterable[Dict[str, Any]]] = None,
+        *,
+        purpose: str,
+    ) -> Dict[str, Any]:
+        """Block structurally expensive requests before contacting a provider."""
+        profile = build_payload_profile(dialogue, tools)
+        message_chars = sum(
+            profile.get(field, 0)
+            for field in (
+                "system_chars",
+                "user_chars",
+                "assistant_chars",
+                "tool_result_chars",
+                "other_message_chars",
+            )
+        )
+        reason = None
+        if self.budget["enabled"]:
+            if profile["tool_count"] > self.budget["max_tools_per_request"]:
+                reason = "request_tool_count_limit"
+            elif (
+                profile["tool_schema_chars"]
+                > self.budget["max_tool_schema_chars_per_request"]
+            ):
+                reason = "request_tool_schema_limit"
+            elif message_chars > self.budget["max_message_chars_per_request"]:
+                reason = "request_message_chars_limit"
+
+        with self._lock:
+            self._last_payload_profile = {
+                **profile,
+                "message_chars": message_chars,
+                "purpose": purpose,
+            }
+            if reason is not None:
+                self._budget_status = "blocked"
+                self._budget_reason = reason
+            event = self._budget_event_locked(
+                action="payload_blocked" if reason else "payload_authorized",
+                status="blocked" if reason else self._budget_status,
+                reason=reason,
+            )
+            event.update(self._last_payload_profile)
+        self._emit_budget_event(event)
+        if reason is not None:
+            raise TokenBudgetExceeded(
+                reason,
+                "本次请求上下文超过预算限制，请缩小请求范围后重试。",
+                event,
+            )
+        return profile
 
     def next_request(self, purpose: str) -> Dict[str, Any]:
         with self._lock:
@@ -705,6 +802,8 @@ class LLMUsageTurnTracker:
             "budget_enabled": self.budget["enabled"],
             "budget_status": budget_status,
             "budget_reason": budget_reason,
+            "budget_profile": self.budget_profile,
+            **self.route_metadata,
             "output_cap_enforced": self.output_cap_enforced,
             "known_total_tokens": sum(
                 event.get("total_tokens") or 0
@@ -721,6 +820,9 @@ class LLMUsageTurnTracker:
                     "max_tool_calls_per_turn",
                     "max_output_tokens_per_request",
                     "warn_at_percent",
+                    "max_tools_per_request",
+                    "max_tool_schema_chars_per_request",
+                    "max_message_chars_per_request",
                 )
             },
         }

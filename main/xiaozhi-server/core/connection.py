@@ -34,6 +34,10 @@ from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
+from core.providers.tools.tool_routing import (
+    ToolRouteDecision,
+    select_candidate_tools,
+)
 from core.providers.llm.usage import (
     LLMUsageTurnTracker,
     TokenBudgetExceeded,
@@ -1036,7 +1040,58 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
-    def _start_llm_usage_turn(self, turn_id):
+    def _select_tool_route(self, query):
+        if self.intent_type != "function_call" or self.func_handler is None:
+            return ToolRouteDecision(
+                route="chat",
+                reason="function_call_disabled",
+                candidates=[],
+                available_tool_count=0,
+                candidate_schema_chars=0,
+            )
+        available = list(self.func_handler.get_functions() or [])
+        routing_config = self.config.get("tool_routing", {})
+        return select_candidate_tools(
+            query or "",
+            available,
+            max_candidates=int(routing_config.get("max_candidates", 5)),
+            max_schema_chars=int(
+                routing_config.get("max_tool_schema_chars", 5000)
+            ),
+        )
+
+    def _compact_system_prompt(self):
+        routing_config = self.config.get("tool_routing", {})
+        max_base_chars = max(
+            200, int(routing_config.get("compact_base_prompt_max_chars", 2400))
+        )
+        base_prompt = str(self.config.get("prompt") or "").strip()[:max_base_chars]
+        from core.utils.current_time import get_current_time_info
+
+        current_time, today_date, today_weekday, lunar_date = get_current_time_info()
+        return (
+            "你是实时中文语音助手。直接回答当前问题，默认只说1至2句话，"
+            "通常不超过50个汉字；只有用户明确要求详细解释时才展开。"
+            "内容要自然、准确、适合TTS朗读，不使用Markdown，不泄露内部错误、"
+            "协议、请求ID或工具参数。普通聊天不得调用工具；如果本请求提供了工具，"
+            "只在用户意图明确匹配时调用。信息不足时只问一个最必要的问题。\n"
+            f"当前时间：{current_time}；日期：{today_date}（{today_weekday}）；"
+            f"农历：{lunar_date.strip()}。\n"
+            f"角色与业务要求：\n{base_prompt}"
+        )
+
+    def _compact_dialogue(self):
+        routing_config = self.config.get("tool_routing", {})
+        return self.dialogue.get_compact_dialogue(
+            self._compact_system_prompt(),
+            max_history_messages=int(
+                routing_config.get("max_history_messages", 6)
+            ),
+            max_history_chars=int(routing_config.get("max_history_chars", 2000)),
+        )
+
+    def _start_llm_usage_turn(self, turn_id, route_decision):
+        profile = "tool" if route_decision.route == "tool" else "chat"
         self._llm_usage_tracker = LLMUsageTurnTracker(
             logger=self.logger.bind(tag=TAG),
             turn_id=turn_id,
@@ -1047,13 +1102,22 @@ class ConnectionHandler:
             output_cap_enforced=getattr(
                 self.llm, "supports_max_tokens_override", False
             ),
+            budget_profile=profile,
+            route_metadata={
+                "request_route": route_decision.route,
+                "routing_reason": route_decision.reason,
+                "available_tool_count": route_decision.available_tool_count,
+                "selected_tool_count": len(route_decision.candidates),
+                "selected_tool_schema_chars": route_decision.candidate_schema_chars,
+            },
         )
 
-    def _next_llm_usage_context(self, depth):
+    def _next_llm_usage_context(self, depth, dialogue, functions):
         tracker = getattr(self, "_llm_usage_tracker", None)
         if tracker is None:
             return None
         purpose = "initial_response" if depth == 0 else "tool_followup"
+        tracker.authorize_payload(dialogue, functions, purpose=purpose)
         usage_context = tracker.next_request(purpose)
         if not getattr(self.llm, "supports_usage_context", False):
             return None
@@ -1155,7 +1219,10 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
-            self._start_llm_usage_turn(current_sentence_id)
+            self._active_tool_route = self._select_tool_route(query)
+            self._start_llm_usage_turn(
+                current_sentence_id, self._active_tool_route
+            )
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1190,14 +1257,12 @@ class ConnectionHandler:
         # 达到最大深度时，禁用工具调用，强制 LLM 直接回答
         if (
                 self.intent_type == "function_call"
-                and hasattr(self, "func_handler")
+                and depth == 0
                 and not force_final_answer
+                and getattr(self, "_active_tool_route", None) is not None
+                and self._active_tool_route.route == "tool"
         ):
-            functions = list(self.func_handler.get_functions())
-            # 仅在第一层调用时注入 direct_answer 虚拟工具
-            # 递归调用（depth>0）不注入，避免模型在生成文本回复时再次调 direct_answer 导致循环
-            if functions is not None and depth == 0:
-                functions.append(DIRECT_ANSWER_TOOL)
+            functions = list(self._active_tool_route.candidates)
 
         response_message = []
 
@@ -1219,7 +1284,10 @@ class ConnectionHandler:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
-            usage_context = self._next_llm_usage_context(depth)
+            llm_dialogue = self._compact_dialogue()
+            usage_context = self._next_llm_usage_context(
+                depth, llm_dialogue, functions
+            )
             usage_kwargs = (
                 {"usage_context": usage_context} if usage_context is not None else {}
             )
@@ -1230,18 +1298,14 @@ class ConnectionHandler:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                     functions=functions,
                     **usage_kwargs,
                 )
             else:
                 llm_responses = self.llm.response(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                     **usage_kwargs,
                 )
         except TokenBudgetExceeded as exc:
@@ -1602,39 +1666,32 @@ class ConnectionHandler:
                 self.dialogue.put(Message(role="assistant", content="，".join(response_parts)))
 
         if need_llm_tools:
-            all_tool_calls = [
-                {
-                    "id": tool_call_data["id"],
-                    "function": {
-                        "arguments": (
-                            "{}"
-                            if tool_call_data["arguments"] == ""
-                            else tool_call_data["arguments"]
-                        ),
-                        "name": tool_call_data["name"],
-                    },
-                    "type": "function",
-                    "index": idx,
-                }
-                for idx, (_, tool_call_data) in enumerate(need_llm_tools)
-            ]
-            self.dialogue.put(Message(role="assistant", tool_calls=all_tool_calls))
-
+            result_limit = int(
+                self.config.get("tool_routing", {}).get(
+                    "max_tool_result_chars", 3000
+                )
+            )
+            remaining = max(200, result_limit)
+            result_parts = []
             for result, tool_call_data in need_llm_tools:
-                text = result.result
-                if text is not None and len(text) > 0:
-                    self.dialogue.put(
-                        Message(
-                            role="tool",
-                            tool_call_id=(
-                                str(uuid.uuid4())
-                                if tool_call_data["id"] is None
-                                else tool_call_data["id"]
-                            ),
-                            content=text,
-                        )
-                    )
-
+                text = str(result.result or "")
+                part = f"{tool_call_data['name']}：{text}"
+                if len(part) > remaining:
+                    part = part[:remaining]
+                if part:
+                    result_parts.append(part)
+                    remaining -= len(part)
+                if remaining <= 0:
+                    break
+            self.dialogue.put(
+                Message(
+                    role="user",
+                    content=(
+                        "[工具执行结果，请直接向用户总结，不要再调用工具]\n"
+                        + "\n".join(result_parts)
+                    ),
+                )
+            )
             self.chat(None, depth=depth + 1)
 
     def _report_worker(self):

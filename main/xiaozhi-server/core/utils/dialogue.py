@@ -52,6 +52,45 @@ class Dialogue:
         # 这样确保说话人功能在所有调用路径下都生效
         return self.get_llm_dialogue_with_memory(None, None)
 
+    def get_compact_dialogue(
+            self,
+            system_prompt: str,
+            *,
+            max_history_messages: int = 6,
+            max_history_chars: int = 2000,
+    ) -> List[Dict[str, str]]:
+        """Return a tool-free, bounded dialogue for cost-sensitive requests.
+
+        Temporary few-shot messages, tool calls and tool results are excluded.
+        History is selected from newest to oldest under both message and
+        character limits, then restored to chronological order.
+        """
+        result = [{"role": "system", "content": system_prompt}]
+        eligible = [
+            message
+            for message in self.dialogue
+            if (
+                message.role in {"user", "assistant"}
+                and not message.is_temporary
+                and message.tool_calls is None
+                and isinstance(message.content, str)
+                and message.content.strip()
+            )
+        ]
+        selected = []
+        used_chars = 0
+        for message in reversed(eligible):
+            serialized_chars = len(message.content)
+            if selected and used_chars + serialized_chars > max_history_chars:
+                break
+            if len(selected) >= max_history_messages:
+                break
+            selected.append(message)
+            used_chars += serialized_chars
+        for message in reversed(selected):
+            self.getMessages(message, result)
+        return result
+
     def update_system_message(self, new_content: str):
         """更新或添加系统消息"""
         # 查找第一个系统消息

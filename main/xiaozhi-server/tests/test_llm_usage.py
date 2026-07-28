@@ -396,6 +396,102 @@ class LLMUsageTest(unittest.TestCase):
         self.assertNotIn("must-not-leak", serialized)
         self.assertNotIn("prompt", payload["usage"])
 
+    def test_chat_profile_blocks_any_tool_schema_before_provider_call(self):
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=CapturingLogger(),
+            turn_id="turn-chat",
+            session_id="session-chat",
+            budget_config={
+                "enabled": True,
+                "profiles": {
+                    "chat": {
+                        "max_total_tokens_per_turn": 2000,
+                        "max_llm_calls_per_turn": 1,
+                        "max_tool_calls_per_turn": 0,
+                        "max_output_tokens_per_request": 80,
+                        "max_tools_per_request": 0,
+                        "max_tool_schema_chars_per_request": 0,
+                        "max_message_chars_per_request": 5000,
+                    }
+                },
+            },
+            budget_profile="chat",
+        )
+
+        with self.assertRaises(MODULE.TokenBudgetExceeded) as captured:
+            tracker.authorize_payload(
+                [{"role": "user", "content": "你好"}],
+                [{"type": "function", "function": {"name": "unexpected"}}],
+                purpose="initial_response",
+            )
+
+        self.assertEqual(captured.exception.reason, "request_tool_count_limit")
+
+    def test_tool_profile_enforces_schema_size_before_provider_call(self):
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=CapturingLogger(),
+            turn_id="turn-tool",
+            session_id="session-tool",
+            budget_config={
+                "enabled": True,
+                "profiles": {
+                    "tool": {
+                        "max_tool_schema_chars_per_request": 40,
+                        "max_tools_per_request": 5,
+                    }
+                },
+            },
+            budget_profile="tool",
+        )
+
+        with self.assertRaises(MODULE.TokenBudgetExceeded) as captured:
+            tracker.authorize_payload(
+                [{"role": "user", "content": "创建便签"}],
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "notes_create",
+                            "description": "x" * 100,
+                        },
+                    }
+                ],
+                purpose="initial_response",
+            )
+
+        self.assertEqual(captured.exception.reason, "request_tool_schema_limit")
+
+    def test_summary_exposes_route_counts_without_tool_names(self):
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=CapturingLogger(),
+            turn_id="turn-route",
+            session_id="session-route",
+            budget_config={"enabled": True},
+            budget_profile="tool",
+            route_metadata={
+                "request_route": "tool",
+                "routing_reason": "explicit_tool_candidates",
+                "available_tool_count": 38,
+                "selected_tool_count": 2,
+                "selected_tool_schema_chars": 900,
+            },
+        )
+        tracker.next_request("initial_response")
+        tracker.record(
+            {
+                "total_tokens": 500,
+                "input_tokens": 480,
+                "output_tokens": 20,
+                "usage_source": "provider",
+            }
+        )
+        summary = tracker.finish()
+        payload = MODULE.build_client_usage_payload(summary, "session-route")
+
+        self.assertEqual(payload["usage"]["budget_profile"], "tool")
+        self.assertEqual(payload["usage"]["selected_tool_count"], 2)
+        self.assertNotIn("selected_tool_names", payload["usage"])
+
 
 if __name__ == "__main__":
     unittest.main()

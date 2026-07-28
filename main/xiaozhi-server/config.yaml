@@ -67,19 +67,44 @@ tool_call_timeout: 30
 # TOKEN_BUDGET 结构化日志，并通过 token_usage 安全消息发送回支持的客户端。
 token_budget:
   enabled: true
-  # 供应商返回的本轮累计 Token 达到该值后，不再发起后续 LLM/工具调用。
-  # 首次请求的输入 Token 无法跨供应商精确预判，因此可能在响应后才触达此线。
-  max_total_tokens_per_turn: 12000
-  # 包括首次回答和工具结果回送给 LLM 的递归请求。
-  max_llm_calls_per_turn: 3
-  # 一轮内真实执行的工具总数；并行批次按工具数量计数，超出时整批拒绝。
-  max_tool_calls_per_turn: 8
-  # 每次请求的最大输出 Token。支持 max_tokens 的适配器会取模型配置与此值的较小者。
-  max_output_tokens_per_request: 200
-  # 达到本轮总预算的该百分比后，日志与客户端诊断显示 warning。
+  # 顶层值是兼容回退；实际请求优先使用 chat/tool 分层配置。
+  max_total_tokens_per_turn: 6000
+  max_llm_calls_per_turn: 2
+  max_tool_calls_per_turn: 3
+  max_output_tokens_per_request: 120
   warn_at_percent: 80
-  # 向客户端发送仅含数字、状态和模型名的安全汇总。
   client_telemetry: true
+  max_tools_per_request: 5
+  max_tool_schema_chars_per_request: 5000
+  max_message_chars_per_request: 9000
+  profiles:
+    # 普通聊天：无工具、单次请求、短回答。实际 provider usage 超线后也会明确告警。
+    chat:
+      max_total_tokens_per_turn: 2000
+      max_llm_calls_per_turn: 1
+      max_tool_calls_per_turn: 0
+      max_output_tokens_per_request: 80
+      max_tools_per_request: 0
+      max_tool_schema_chars_per_request: 0
+      max_message_chars_per_request: 5000
+    # 工具请求：只允许候选工具，工具结果总结不再携带 schema。
+    tool:
+      max_total_tokens_per_turn: 6000
+      max_llm_calls_per_turn: 2
+      max_tool_calls_per_turn: 3
+      max_output_tokens_per_request: 120
+      max_tools_per_request: 5
+      max_tool_schema_chars_per_request: 5000
+      max_message_chars_per_request: 9000
+
+# 本地工具路由不调用云模型；模糊请求默认走普通聊天并要求澄清。
+tool_routing:
+  max_candidates: 3
+  max_tool_schema_chars: 5000
+  compact_base_prompt_max_chars: 2400
+  max_history_messages: 6
+  max_history_chars: 2000
+  max_tool_result_chars: 3000
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词

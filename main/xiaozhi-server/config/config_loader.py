@@ -43,6 +43,7 @@ async def load_config():
         config = await get_config_from_api_async(custom_config)
         local_config = merge_configs(default_config, custom_config)
         config["token_budget"] = local_config.get("token_budget", {})
+        config["tool_routing"] = local_config.get("tool_routing", {})
     else:
         # 合并配置
         config = merge_configs(default_config, custom_config)
