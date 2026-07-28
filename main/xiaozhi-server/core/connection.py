@@ -1051,9 +1051,23 @@ class ConnectionHandler:
             )
         available = list(self.func_handler.get_functions() or [])
         routing_config = self.config.get("tool_routing", {})
+        previous_query = ""
+        previous_assistant = ""
+        for message in reversed(getattr(self.dialogue, "dialogue", [])):
+            content = getattr(message, "content", None)
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if message.role == "assistant" and not previous_assistant:
+                previous_assistant = content
+                continue
+            if message.role == "user" and previous_assistant:
+                previous_query = content
+                break
         return select_candidate_tools(
             query or "",
             available,
+            previous_query=previous_query,
+            previous_assistant=previous_assistant,
             max_candidates=int(routing_config.get("max_candidates", 5)),
             max_schema_chars=int(
                 routing_config.get("max_tool_schema_chars", 5000)
@@ -1074,7 +1088,10 @@ class ConnectionHandler:
             "通常不超过50个汉字；只有用户明确要求详细解释时才展开。"
             "内容要自然、准确、适合TTS朗读，不使用Markdown，不泄露内部错误、"
             "协议、请求ID或工具参数。普通聊天不得调用工具；如果本请求提供了工具，"
-            "只在用户意图明确匹配时调用。信息不足时只问一个最必要的问题。\n"
+            "只在用户意图明确匹配时调用。信息不足时只问一个最必要的问题；如果上一轮"
+            "为工具操作追问参数，本轮用户的简短回答应视为参数补充并继续完成该工具操作。"
+            "只有收到工具返回的成功结果后，才能声称已经创建、修改、删除、查询或执行成功；"
+            "没有调用工具时绝不能假装操作已经完成。\n"
             f"当前时间：{current_time}；日期：{today_date}（{today_weekday}）；"
             f"农历：{lunar_date.strip()}。\n"
             f"角色与业务要求：\n{base_prompt}"

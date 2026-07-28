@@ -63,6 +63,13 @@ _ACTION_HINTS = {
     "reject": re.compile(r"取消|拒绝|不要了"),
 }
 
+_CLARIFICATION_PATTERN = re.compile(
+    r"请.{0,12}(告诉|提供|补充|说明|选择)|"
+    r"(需要|还缺|缺少).{0,12}(什么|哪些|哪一|信息|内容|标题|地点|城市)|"
+    r"(什么|哪些|哪一|哪个|哪里|几号|几点|是否).{0,8}[？?]?$|"
+    r"[？?]$"
+)
+
 
 def _tool_name(tool: Dict[str, Any]) -> str:
     function = tool.get("function", {}) if isinstance(tool, dict) else {}
@@ -119,12 +126,26 @@ def select_candidate_tools(
     query: str,
     tools: Iterable[Dict[str, Any]],
     *,
+    previous_query: str = "",
+    previous_assistant: str = "",
     max_candidates: int = 5,
     max_schema_chars: int = 5_000,
 ) -> ToolRouteDecision:
     available = list(tools or [])
     normalized_query = (query or "").strip().lower()
     domains = _query_domains(normalized_query)
+    continuation = False
+
+    if (
+        normalized_query
+        and not domains
+        and _CLARIFICATION_PATTERN.search((previous_assistant or "").strip())
+    ):
+        previous_domains = _query_domains((previous_query or "").strip().lower())
+        if previous_domains:
+            domains = previous_domains
+            normalized_query = f"{previous_query} {query}".strip().lower()
+            continuation = True
 
     if not normalized_query:
         candidates: List[Dict[str, Any]] = []
@@ -156,7 +177,14 @@ def select_candidate_tools(
             )
             if proposed_chars <= max(0, int(max_schema_chars)):
                 candidates.append(tool)
-        reason = "explicit_tool_candidates" if candidates else "domain_without_candidate"
+        if candidates:
+            reason = (
+                "tool_parameter_continuation"
+                if continuation
+                else "explicit_tool_candidates"
+            )
+        else:
+            reason = "domain_without_candidate"
 
     schema_chars = (
         len(

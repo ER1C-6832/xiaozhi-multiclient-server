@@ -51,6 +51,37 @@ class ToolRoutingTest(unittest.TestCase):
         self.assertEqual(names[0], "notes_create")
         self.assertLessEqual(len(names), 5)
 
+    def test_note_parameter_followup_keeps_tool_route(self):
+        decision = MODULE.select_candidate_tools(
+            "标题写1内容写2",
+            TOOLS,
+            previous_query="帮我加便签",
+            previous_assistant="好的，请告诉我便签的内容",
+        )
+        names = [item["function"]["name"] for item in decision.candidates]
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.reason, "tool_parameter_continuation")
+        self.assertEqual(names[0], "notes_create")
+
+    def test_unrelated_message_after_completed_tool_text_stays_chat(self):
+        decision = MODULE.select_candidate_tools(
+            "你好",
+            TOOLS,
+            previous_query="帮我加便签",
+            previous_assistant="便签已经添加完成",
+        )
+        self.assertEqual(decision.route, "chat")
+        self.assertEqual(decision.reason, "no_explicit_tool_domain")
+
+    def test_generic_assistant_question_does_not_inherit_without_tool_domain(self):
+        decision = MODULE.select_candidate_tools(
+            "随便聊聊",
+            TOOLS,
+            previous_query="你好",
+            previous_assistant="有什么可以帮助你的吗？",
+        )
+        self.assertEqual(decision.route, "chat")
+
     def test_music_does_not_expose_note_tools(self):
         decision = MODULE.select_candidate_tools("播放一首音乐", TOOLS)
         names = [item["function"]["name"] for item in decision.candidates]
