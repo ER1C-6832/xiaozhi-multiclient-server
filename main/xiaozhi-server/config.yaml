@@ -63,6 +63,23 @@ close_connection_no_voice_time: 120
 tts_timeout: 10
 # 工具调用超时时间(秒)
 tool_call_timeout: 30
+# 大模型 Token 预算控制。默认关闭以保持上游兼容；启用后所有阻断均会写入
+# TOKEN_BUDGET 结构化日志，并通过 token_usage 安全消息发送回支持的客户端。
+token_budget:
+  enabled: true
+  # 供应商返回的本轮累计 Token 达到该值后，不再发起后续 LLM/工具调用。
+  # 首次请求的输入 Token 无法跨供应商精确预判，因此可能在响应后才触达此线。
+  max_total_tokens_per_turn: 12000
+  # 包括首次回答和工具结果回送给 LLM 的递归请求。
+  max_llm_calls_per_turn: 3
+  # 一轮内真实执行的工具总数；并行批次按工具数量计数，超出时整批拒绝。
+  max_tool_calls_per_turn: 8
+  # 每次请求的最大输出 Token。支持 max_tokens 的适配器会取模型配置与此值的较小者。
+  max_output_tokens_per_request: 200
+  # 达到本轮总预算的该百分比后，日志与客户端诊断显示 warning。
+  warn_at_percent: 80
+  # 向客户端发送仅含数字、状态和模型名的安全汇总。
+  client_telemetry: true
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词

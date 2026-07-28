@@ -25,6 +25,9 @@ class CapturingLogger:
     def info(self, message):
         self.messages.append(message)
 
+    def warning(self, message):
+        self.messages.append(message)
+
 
 class LLMUsageTest(unittest.TestCase):
     def test_normalizes_openai_object_and_details(self):
@@ -248,6 +251,150 @@ class LLMUsageTest(unittest.TestCase):
         summary = tracker.finish("usage_unavailable")
         self.assertIsNone(summary["total_tokens"])
         self.assertEqual(summary["provider_usage_call_count"], 0)
+
+    def test_budget_caps_output_and_blocks_extra_llm_call(self):
+        logger = CapturingLogger()
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=logger,
+            turn_id="turn-budget-calls",
+            session_id="session-budget",
+            budget_config={
+                "enabled": True,
+                "max_llm_calls_per_turn": 1,
+                "max_output_tokens_per_request": 120,
+            },
+        )
+
+        self.assertEqual(tracker.effective_max_output_tokens(500), 120)
+        self.assertEqual(tracker.next_request("initial_response")["call_index"], 1)
+        with self.assertRaises(MODULE.TokenBudgetExceeded) as caught:
+            tracker.next_request("tool_followup")
+
+        self.assertEqual(caught.exception.reason, "llm_call_limit")
+        summary = tracker.finish()
+        self.assertEqual(summary["status"], "budget_blocked")
+        self.assertEqual(summary["budget_reason"], "llm_call_limit")
+        self.assertEqual(summary["llm_calls_started"], 1)
+
+    def test_budget_blocks_tools_after_real_token_limit(self):
+        logger = CapturingLogger()
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=logger,
+            turn_id="turn-budget-token",
+            session_id="session-budget",
+            budget_config={
+                "enabled": True,
+                "max_total_tokens_per_turn": 100,
+                "max_tool_calls_per_turn": 4,
+            },
+        )
+        tracker.next_request("initial_response")
+        tracker.record(
+            {
+                "usage_source": "provider",
+                "tool_count": 2,
+                "input_tokens": 95,
+                "output_tokens": 10,
+                "total_tokens": 105,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 0,
+                "tool_input_tokens": 0,
+            }
+        )
+
+        with self.assertRaises(MODULE.TokenBudgetExceeded) as caught:
+            tracker.authorize_tools(2)
+
+        self.assertEqual(caught.exception.reason, "turn_token_limit")
+        summary = tracker.finish()
+        self.assertEqual(summary["known_total_tokens"], 105)
+        self.assertEqual(summary["budget_status"], "blocked")
+
+    def test_budget_rejects_whole_tool_batch_before_execution(self):
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=CapturingLogger(),
+            turn_id="turn-budget-tools",
+            session_id="session-budget",
+            budget_config={
+                "enabled": True,
+                "max_tool_calls_per_turn": 2,
+            },
+        )
+
+        with self.assertRaises(MODULE.TokenBudgetExceeded) as caught:
+            tracker.authorize_tools(3)
+
+        self.assertEqual(caught.exception.reason, "tool_call_limit")
+        self.assertEqual(tracker.finish()["tool_call_count"], 0)
+
+    def test_budget_summary_callback_is_safe_and_explicit(self):
+        summaries = []
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=CapturingLogger(),
+            turn_id="turn-budget-summary",
+            session_id="session-budget",
+            model="provider-model",
+            budget_config={"enabled": True, "client_telemetry": True},
+            summary_callback=summaries.append,
+            output_cap_enforced=True,
+        )
+        tracker.next_request("initial_response")
+        tracker.record(
+            {
+                "usage_source": "provider",
+                "tool_count": 0,
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+                "cached_input_tokens": None,
+                "reasoning_tokens": None,
+                "tool_input_tokens": None,
+            }
+        )
+        summary = tracker.finish()
+
+        self.assertEqual(summaries, [summary])
+        self.assertTrue(summary["budget_enabled"])
+        self.assertEqual(summary["budget_status"], "within_budget")
+        self.assertEqual(summary["known_total_tokens"], 12)
+        self.assertTrue(summary["provider_usage_complete"])
+        self.assertTrue(summary["output_cap_enforced"])
+
+    def test_disabled_budget_preserves_unrestricted_call_count(self):
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=CapturingLogger(),
+            turn_id="turn-budget-disabled",
+            session_id="session-budget",
+            budget_config={
+                "enabled": False,
+                "max_llm_calls_per_turn": 1,
+            },
+        )
+
+        self.assertEqual(tracker.next_request("initial_response")["call_index"], 1)
+        self.assertEqual(tracker.next_request("tool_followup")["call_index"], 2)
+        self.assertEqual(tracker.effective_max_output_tokens(500), 500)
+
+    def test_client_payload_uses_strict_safe_allowlist(self):
+        payload = MODULE.build_client_usage_payload(
+            {
+                "turn_id": "turn-public",
+                "model": "model-public",
+                "total_tokens": 10,
+                "budget_enabled": True,
+                "prompt": "must-not-leak",
+                "api_key": "must-not-leak",
+                "tool_arguments": "must-not-leak",
+            },
+            "session-public",
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+
+        self.assertEqual(payload["type"], "token_usage")
+        self.assertEqual(payload["session_id"], "session-public")
+        self.assertEqual(payload["usage"]["total_tokens"], 10)
+        self.assertNotIn("must-not-leak", serialized)
+        self.assertNotIn("prompt", payload["usage"])
 
 
 if __name__ == "__main__":

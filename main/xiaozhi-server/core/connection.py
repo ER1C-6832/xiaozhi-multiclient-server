@@ -34,7 +34,11 @@ from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
-from core.providers.llm.usage import LLMUsageTurnTracker
+from core.providers.llm.usage import (
+    LLMUsageTurnTracker,
+    TokenBudgetExceeded,
+    build_client_usage_payload,
+)
 from plugins_func.loadplugins import auto_import_modules
 from plugins_func.register import Action, ActionResponse
 from core.auth import AuthenticationError
@@ -1038,14 +1042,79 @@ class ConnectionHandler:
             turn_id=turn_id,
             session_id=self.session_id,
             model=getattr(self.llm, "model_name", None),
+            budget_config=self.config.get("token_budget", {}),
+            summary_callback=self._publish_llm_usage_summary,
+            output_cap_enforced=getattr(
+                self.llm, "supports_max_tokens_override", False
+            ),
         )
 
     def _next_llm_usage_context(self, depth):
         tracker = getattr(self, "_llm_usage_tracker", None)
-        if tracker is None or not getattr(self.llm, "supports_usage_context", False):
+        if tracker is None:
             return None
         purpose = "initial_response" if depth == 0 else "tool_followup"
-        return tracker.next_request(purpose)
+        usage_context = tracker.next_request(purpose)
+        if not getattr(self.llm, "supports_usage_context", False):
+            return None
+        return usage_context
+
+    def _llm_budget_max_output_tokens(self):
+        tracker = getattr(self, "_llm_usage_tracker", None)
+        if tracker is None:
+            return None
+        return tracker.effective_max_output_tokens(
+            getattr(self.llm, "max_tokens", None)
+        )
+
+    def _publish_llm_usage_summary(self, summary):
+        if self.websocket is None or self.loop is None or self.loop.is_closed():
+            return
+        payload = build_client_usage_payload(summary, self.session_id)
+        future = asyncio.run_coroutine_threadsafe(
+            self.websocket.send(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ),
+            self.loop,
+        )
+
+        def log_publish_failure(completed):
+            try:
+                completed.result()
+            except Exception as exc:
+                self.logger.bind(tag=TAG).warning(
+                    f"Token usage telemetry send failed: {exc}"
+                )
+
+        future.add_done_callback(log_publish_failure)
+
+    def _handle_token_budget_exceeded(self, exc, current_sentence_id, depth):
+        self.logger.bind(tag=TAG).warning(
+            f"Token budget blocked turn: reason={exc.reason}, depth={depth}"
+        )
+        self.tts.tts_text_queue.put(
+            TTSMessageDTO(
+                sentence_id=current_sentence_id,
+                sentence_type=SentenceType.MIDDLE,
+                content_type=ContentType.TEXT,
+                content_detail=exc.public_message,
+            )
+        )
+        self.tts.store_tts_text(current_sentence_id, exc.public_message)
+        self.dialogue.put(Message(role="assistant", content=exc.public_message))
+        if depth == 0:
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=current_sentence_id,
+                    sentence_type=SentenceType.LAST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+            self._finish_llm_usage_turn("budget_blocked")
 
     def _finish_llm_usage_turn(self, status="completed"):
         tracker = getattr(self, "_llm_usage_tracker", None)
@@ -1154,6 +1223,9 @@ class ConnectionHandler:
             usage_kwargs = (
                 {"usage_context": usage_context} if usage_context is not None else {}
             )
+            budget_max_output_tokens = self._llm_budget_max_output_tokens()
+            if budget_max_output_tokens is not None:
+                usage_kwargs["max_tokens"] = budget_max_output_tokens
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
@@ -1172,6 +1244,9 @@ class ConnectionHandler:
                     ),
                     **usage_kwargs,
                 )
+        except TokenBudgetExceeded as exc:
+            self._handle_token_budget_exceeded(exc, current_sentence_id, depth)
+            return None
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
             if depth == 0:
@@ -1348,6 +1423,15 @@ class ConnectionHandler:
                     tool_calls_list = real_tool_calls
 
             if not bHasError and len(tool_calls_list) > 0:
+                tracker = getattr(self, "_llm_usage_tracker", None)
+                if tracker is not None:
+                    try:
+                        tracker.authorize_tools(len(tool_calls_list))
+                    except TokenBudgetExceeded as exc:
+                        self._handle_token_budget_exceeded(
+                            exc, current_sentence_id, depth
+                        )
+                        return
                 self.logger.bind(tag=TAG).debug(
                     f"检测到 {len(tool_calls_list)} 个工具调用"
                 )

@@ -41,6 +41,8 @@ async def load_config():
 
     if custom_config.get("manager-api", {}).get("url"):
         config = await get_config_from_api_async(custom_config)
+        local_config = merge_configs(default_config, custom_config)
+        config["token_budget"] = local_config.get("token_budget", {})
     else:
         # 合并配置
         config = merge_configs(default_config, custom_config)

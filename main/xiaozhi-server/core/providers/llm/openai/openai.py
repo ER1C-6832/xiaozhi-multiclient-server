@@ -22,6 +22,7 @@ THINKING_DISABLED_DOMAINS = {
 
 class LLMProvider(LLMProviderBase):
     supports_usage_context = True
+    supports_max_tokens_override = True
 
     def __init__(self, config):
         self.model_name = config.get("model_name")
