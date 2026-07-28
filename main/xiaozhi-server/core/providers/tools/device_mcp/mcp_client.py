@@ -19,6 +19,7 @@ class MCPClient:
         self.call_results = {}  # To store Futures for tool call responses
         self.next_id = 1
         self.lock = asyncio.Lock()
+        self.control_requests = {}  # request id -> initialize/tools-list method
         self._cached_available_tools = None  # Cache for get_available_tools
 
     def has_tool(self, name: str) -> bool:
@@ -68,6 +69,19 @@ class MCPClient:
             current_id = self.next_id
             self.next_id += 1
             return current_id
+
+    async def allocate_control_request_id(self, method: str) -> int:
+        """Allocate and remember an ID for an MCP control-plane request."""
+        async with self.lock:
+            current_id = self.next_id
+            self.next_id += 1
+            self.control_requests[current_id] = method
+            return current_id
+
+    async def pop_control_request_method(self, request_id: int):
+        """Return the control method for a response and forget the request."""
+        async with self.lock:
+            return self.control_requests.pop(request_id, None)
 
     async def register_call_result_future(self, id: int, future: Future):
         async with self.lock:

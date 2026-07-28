@@ -1,12 +1,16 @@
 """设备端MCP工具执行器"""
 
 from typing import Dict, Any, TYPE_CHECKING
+from config.logger import setup_logging
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from ..base import ToolType, ToolDefinition, ToolExecutor
 from plugins_func.register import Action, ActionResponse
 from .mcp_handler import call_mcp_tool
+
+TAG = __name__
+logger = setup_logging()
 
 
 class DeviceMCPExecutor(ToolExecutor):
@@ -63,7 +67,13 @@ class DeviceMCPExecutor(ToolExecutor):
         except ValueError as e:
             return ActionResponse(action=Action.NOTFOUND, response=str(e))
         except Exception as e:
-            return ActionResponse(action=Action.ERROR, response=str(e))
+            logger.bind(tag=TAG).error(
+                f"设备端工具调用失败: tool={tool_name}, error={type(e).__name__}: {e}"
+            )
+            return ActionResponse(
+                action=Action.ERROR,
+                response="设备工具操作暂时没有完成，请稍后重试。",
+            )
 
     def get_tools(self) -> Dict[str, ToolDefinition]:
         """获取所有设备端MCP工具"""
