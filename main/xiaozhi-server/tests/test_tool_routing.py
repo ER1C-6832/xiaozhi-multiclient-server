@@ -30,7 +30,9 @@ def tool(name, description):
 
 TOOLS = [
     tool("notes_create", "创建一条便签或待办，记录用户提供的内容。"),
+    tool("notes_resolve", "按标题或关键词唯一定位便签。"),
     tool("notes_search", "按关键词搜索便签。"),
+    tool("notes_replace_content", "整体替换明确便签的正文。"),
     tool("notes_delete", "删除明确指定的便签。"),
     tool("play_music", "播放音乐或歌曲。"),
     tool("get_weather", "查询其他城市天气。"),
@@ -67,6 +69,26 @@ class ToolRoutingTest(unittest.TestCase):
         decision = MODULE.select_candidate_tools("帮我改内容", TOOLS)
         self.assertEqual(decision.route, "tool")
         self.assertEqual(decision.reason, "explicit_tool_candidates")
+
+    def test_exact_numeric_title_lookup_uses_resolver_not_full_text_search(self):
+        decision = MODULE.select_candidate_tools(
+            "查找标题为3的便签", TOOLS
+        )
+        names = [item["function"]["name"] for item in decision.candidates]
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.reason, "exact_title_lookup")
+        self.assertEqual(names, ["notes_resolve"])
+
+    def test_referential_replace_is_not_misclassified_as_chat(self):
+        decision = MODULE.select_candidate_tools(
+            "5的那条改成114",
+            TOOLS,
+            previous_query="查找标题为3的便签",
+            previous_assistant='找到了标题为"3"的便签，内容是"5"',
+        )
+        names = [item["function"]["name"] for item in decision.candidates]
+        self.assertEqual(decision.route, "tool")
+        self.assertIn("notes_replace_content", names)
 
     def test_unrelated_message_after_completed_tool_text_stays_chat(self):
         decision = MODULE.select_candidate_tools(

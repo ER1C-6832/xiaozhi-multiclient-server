@@ -1103,7 +1103,7 @@ class ConnectionHandler:
         return bool(
             re.search(
                 r"删除|删掉|移除|恢复|还原|找回|追加|补充|补一句|"
-                r"修改|改内容|改正文|改标题|替换|覆盖|置顶|取消置顶|"
+                r"修改|改成|换成|改内容|改正文|改标题|替换|覆盖|置顶|取消置顶|"
                 r"绑定标签|换标签|删除标签|读取|读一下|打开.{0,8}便签",
                 query or "",
             )
@@ -1521,6 +1521,25 @@ class ConnectionHandler:
                     f"Recovered plain-text tool call: {plain_call['name']}"
                 )
             else:
+                # A model response is not proof that a mutation happened.
+                # When tools were offered but none was called, never let an
+                # unverified completion claim reach the user.
+                if (
+                    self._requires_multi_step_tool_chain(query)
+                    and re.search(
+                        r"已.{0,12}(?:修改|改成|替换|覆盖|删除|恢复|"
+                        r"追加|置顶|绑定)|(?:修改|删除|恢复|替换).{0,8}"
+                        r"(?:完成|成功)",
+                        content_arguments,
+                    )
+                ):
+                    self.logger.bind(tag=TAG).warning(
+                        "Blocked unverified tool success claim: "
+                        f"{content_arguments}"
+                    )
+                    content_arguments = (
+                        "操作没有实际执行，请重新说明要处理的便签标题。"
+                    )
                 response_message.append(content_arguments)
                 self.tts.tts_text_queue.put(
                     TTSMessageDTO(

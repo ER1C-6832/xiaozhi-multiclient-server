@@ -26,7 +26,8 @@ class ToolRouteDecision:
 _DOMAIN_PATTERNS = {
     "notes": re.compile(
         r"便签|笔记|待办|备忘|记录|记一下|记下来|标签|回收站|置顶|"
-        r"改内容|修改内容|改正文|修改正文|改标题|修改标题"
+        r"改内容|修改内容|改正文|修改正文|改标题|修改标题|"
+        r"这条|那条|改成|换成"
     ),
     "ui": re.compile(r"界面|页面|打开|显示|切到|回到|搜索框"),
     "confirmation": re.compile(r"确认|取消|拒绝|待确认"),
@@ -57,7 +58,11 @@ _ACTION_HINTS = {
     "get": re.compile(r"读取|读一下|详情|内容|编号"),
     "append": re.compile(r"追加|补充|补一句|后面加"),
     "update_title": re.compile(r"改名|改标题|标题改"),
-    "replace": re.compile(r"替换|覆盖|全部改成|正文改|改内容|修改内容|改正文|修改正文"),
+    "replace": re.compile(
+        r"替换|覆盖|全部改成|正文改|改内容|修改内容|改正文|修改正文|"
+        r"(?:这条|那条|内容|正文|便签).{0,12}(?:改成|换成)|"
+        r".{0,12}的那条.{0,8}(?:改成|换成)"
+    ),
     "delete": re.compile(r"删除|删掉|移除"),
     "restore": re.compile(r"恢复|还原|找回"),
     "pin": re.compile(r"置顶|取消置顶"),
@@ -71,6 +76,16 @@ _CLARIFICATION_PATTERN = re.compile(
     r"(需要|还缺|缺少).{0,12}(什么|哪些|哪一|信息|内容|标题|地点|城市)|"
     r"(什么|哪些|哪一|哪个|哪里|几号|几点|是否).{0,8}[？?]?$|"
     r"[？?]$"
+)
+
+_EXACT_TITLE_LOOKUP_PATTERN = re.compile(
+    r"(?:搜索|查找|查询|找一下|找找|看看).{0,12}"
+    r"标题(?:为|是|叫|名为)"
+)
+
+_MUTATION_PATTERN = re.compile(
+    r"删除|删掉|移除|恢复|还原|找回|追加|补充|改成|换成|"
+    r"修改|替换|覆盖|置顶|绑定"
 )
 
 
@@ -157,6 +172,44 @@ def select_candidate_tools(
         candidates = []
         reason = "no_explicit_tool_domain"
     else:
+        exact_title_lookup = bool(
+            _EXACT_TITLE_LOOKUP_PATTERN.search(normalized_query)
+            and not _MUTATION_PATTERN.search(normalized_query)
+        )
+        if exact_title_lookup:
+            resolver = next(
+                (
+                    tool
+                    for tool in available
+                    if _tool_name(tool) == "notes_resolve"
+                ),
+                None,
+            )
+            candidates = [resolver] if resolver is not None else []
+            reason = (
+                "exact_title_lookup"
+                if candidates
+                else "domain_without_candidate"
+            )
+            schema_chars = (
+                len(
+                    json.dumps(
+                        candidates,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                )
+                if candidates
+                else 0
+            )
+            return ToolRouteDecision(
+                route="tool" if candidates else "chat",
+                reason=reason,
+                candidates=candidates,
+                available_tool_count=len(available),
+                candidate_schema_chars=schema_chars,
+            )
         ranked = sorted(
             (
                 (_score(normalized_query, tool, domains), index, tool)
