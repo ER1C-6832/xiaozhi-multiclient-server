@@ -36,6 +36,7 @@ from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
 from core.providers.tools.tool_routing import (
     ToolRouteDecision,
+    parse_plain_tool_call,
     select_candidate_tools,
 )
 from core.providers.llm.usage import (
@@ -1097,6 +1098,17 @@ class ConnectionHandler:
             f"角色与业务要求：\n{base_prompt}"
         )
 
+    @staticmethod
+    def _requires_multi_step_tool_chain(query):
+        return bool(
+            re.search(
+                r"删除|删掉|移除|恢复|还原|找回|追加|补充|补一句|"
+                r"修改|改内容|改正文|改标题|替换|覆盖|置顶|取消置顶|"
+                r"绑定标签|换标签|删除标签",
+                query or "",
+            )
+        )
+
     def _compact_dialogue(self):
         routing_config = self.config.get("tool_routing", {})
         return self.dialogue.get_compact_dialogue(
@@ -1237,6 +1249,10 @@ class ConnectionHandler:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self._active_tool_route = self._select_tool_route(query)
+            self._allow_tool_followup = (
+                self._active_tool_route.route == "tool"
+                and self._requires_multi_step_tool_chain(query)
+            )
             self._start_llm_usage_turn(
                 current_sentence_id, self._active_tool_route
             )
@@ -1274,7 +1290,13 @@ class ConnectionHandler:
         # 达到最大深度时，禁用工具调用，强制 LLM 直接回答
         if (
                 self.intent_type == "function_call"
-                and depth == 0
+                and (
+                    depth == 0
+                    or (
+                        depth == 1
+                        and getattr(self, "_allow_tool_followup", False)
+                    )
+                )
                 and not force_final_answer
                 and getattr(self, "_active_tool_route", None) is not None
                 and self._active_tool_route.route == "tool"
@@ -1396,7 +1418,7 @@ class ConnectionHandler:
                     emotion_flag = False
 
                 if content is not None and len(content) > 0:
-                    if not tool_call_flag:
+                    if not tool_call_flag and functions is None:
                         response_message.append(content)
                         self.tts.tts_text_queue.put(
                             TTSMessageDTO(
@@ -1426,6 +1448,33 @@ class ConnectionHandler:
                 )
                 self._finish_llm_usage_turn("stream_error")
             return
+
+        if functions is not None and not tool_call_flag and content_arguments:
+            plain_call = parse_plain_tool_call(content_arguments, functions)
+            if plain_call is not None:
+                tool_call_flag = True
+                tool_calls_list.append(
+                    {
+                        "id": str(uuid.uuid4().hex),
+                        "name": plain_call["name"],
+                        "arguments": json.dumps(
+                            plain_call["arguments"], ensure_ascii=False
+                        ),
+                    }
+                )
+                self.logger.bind(tag=TAG).warning(
+                    f"Recovered plain-text tool call: {plain_call['name']}"
+                )
+            else:
+                response_message.append(content_arguments)
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=current_sentence_id,
+                        sentence_type=SentenceType.MIDDLE,
+                        content_type=ContentType.TEXT,
+                        content_detail=content_arguments,
+                    )
+                )
         # 处理function call
         if tool_call_flag:
             bHasError = False
@@ -1700,13 +1749,22 @@ class ConnectionHandler:
                     remaining -= len(part)
                 if remaining <= 0:
                     break
+            allow_followup_tools = (
+                getattr(self, "_allow_tool_followup", False) and depth == 0
+            )
+            followup_instruction = (
+                "[工具执行结果]\n"
+                "如果结果已唯一定位目标，而且用户原请求要求修改、删除或其他写操作，"
+                "请继续调用已提供的下一步工具；如果存在多个候选，只列出候选标题并让"
+                "用户按完整标题选择，禁止猜测；如果操作已完成或需要用户确认，直接说明"
+                "真实状态。未经工具成功结果不得声称完成。\n"
+                if allow_followup_tools
+                else "[工具执行结果，请直接向用户总结，不要再调用工具]\n"
+            )
             self.dialogue.put(
                 Message(
                     role="user",
-                    content=(
-                        "[工具执行结果，请直接向用户总结，不要再调用工具]\n"
-                        + "\n".join(result_parts)
-                    ),
+                    content=followup_instruction + "\n".join(result_parts),
                 )
             )
             self.chat(None, depth=depth + 1)

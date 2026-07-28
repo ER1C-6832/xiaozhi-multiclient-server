@@ -87,7 +87,7 @@ token_budget:
       max_tools_per_request: 0
       max_tool_schema_chars_per_request: 0
       max_message_chars_per_request: 5000
-    # 工具请求：只允许候选工具，工具结果总结不再携带 schema。
+    # 工具请求：只允许小规模候选工具；修改/删除等链式操作允许一次有工具 follow-up。
     tool:
       max_total_tokens_per_turn: 6000
       max_llm_calls_per_turn: 2

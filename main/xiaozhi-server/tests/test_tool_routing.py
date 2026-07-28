@@ -63,6 +63,11 @@ class ToolRoutingTest(unittest.TestCase):
         self.assertEqual(decision.reason, "tool_parameter_continuation")
         self.assertEqual(names[0], "notes_create")
 
+    def test_modify_content_is_an_explicit_note_domain(self):
+        decision = MODULE.select_candidate_tools("帮我改内容", TOOLS)
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.reason, "explicit_tool_candidates")
+
     def test_unrelated_message_after_completed_tool_text_stays_chat(self):
         decision = MODULE.select_candidate_tools(
             "你好",
@@ -100,6 +105,18 @@ class ToolRoutingTest(unittest.TestCase):
             max_schema_chars=350,
         )
         self.assertLessEqual(decision.candidate_schema_chars, 350)
+
+    def test_plain_text_tool_call_is_recovered_only_for_allowed_candidate(self):
+        parsed = MODULE.parse_plain_tool_call(
+            'notes_search{"query":"包装标签"}', TOOLS
+        )
+        self.assertEqual(
+            parsed, {"name": "notes_search", "arguments": {"query": "包装标签"}}
+        )
+        self.assertIsNone(
+            MODULE.parse_plain_tool_call('notes_get{"note_id":1}', TOOLS)
+        )
+        self.assertIsNone(MODULE.parse_plain_tool_call("普通回答", TOOLS))
 
 
 if __name__ == "__main__":

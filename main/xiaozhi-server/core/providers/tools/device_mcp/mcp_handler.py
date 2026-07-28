@@ -20,6 +20,29 @@ class DeviceMCPError(RuntimeError):
     """Internal device MCP failure; details are for diagnostics, not end users."""
 
 
+def normalize_device_tool_arguments(tool_name: str, arguments: dict) -> dict:
+    """Apply protocol-side safety defaults independent of model quality."""
+    normalized = dict(arguments)
+    if tool_name == "notes.search":
+        try:
+            normalized["limit"] = max(5, min(10, int(normalized.get("limit", 10))))
+        except (TypeError, ValueError):
+            normalized["limit"] = 10
+    elif tool_name == "notes.resolve" and "exact_title" not in normalized:
+        query = str(normalized.get("query", "")).strip()
+        match = re.fullmatch(r"标题(?:是|叫|写)?\s*[：:]?\s*(.+)", query)
+        if match:
+            exact_title = re.sub(
+                r"的(?:那条|那个|便签)$", "", match.group(1).strip()
+            ).strip()
+        else:
+            exact_title = ""
+        if exact_title:
+            normalized.pop("query", None)
+            normalized["exact_title"] = exact_title
+    return normalized
+
+
 async def send_mcp_message(conn: "ConnectionHandler", payload: dict):
     """Helper to send MCP messages, encapsulating common logic."""
     if not conn.features.get("mcp"):
@@ -288,6 +311,7 @@ async def call_mcp_tool(
         raise e
 
     actual_name = mcp_client.name_mapping.get(tool_name, tool_name)
+    arguments = normalize_device_tool_arguments(actual_name, arguments)
     payload = {
         "jsonrpc": "2.0",
         "id": tool_call_id,
@@ -295,7 +319,10 @@ async def call_mcp_tool(
         "params": {"name": actual_name, "arguments": arguments},
     }
 
-    logger.bind(tag=TAG).info(f"发送客户端mcp工具调用请求: {actual_name}，参数: {args}")
+    logger.bind(tag=TAG).info(
+        f"发送客户端mcp工具调用请求: {actual_name}，参数: "
+        f"{json.dumps(arguments, ensure_ascii=False)}"
+    )
     await send_mcp_message(conn, payload)
 
     try:
@@ -306,17 +333,15 @@ async def call_mcp_tool(
         )
 
         if isinstance(raw_result, dict):
-            if raw_result.get("isError") is True:
-                error_msg = raw_result.get(
-                    "error", "工具调用返回错误，但未提供具体错误信息"
-                )
-                raise RuntimeError(f"工具调用错误: {error_msg}")
-
             content = raw_result.get("content")
             if isinstance(content, list) and len(content) > 0:
                 if isinstance(content[0], dict) and "text" in content[0]:
-                    # 直接返回文本内容，不进行JSON解析
                     return content[0]["text"]
+            if raw_result.get("isError") is True:
+                error_msg = raw_result.get(
+                    "error", "工具调用返回错误，但未提供结构化结果"
+                )
+                raise DeviceMCPError(str(error_msg))
         # 如果结果不是预期的格式，将其转换为字符串
         return str(raw_result)
     except asyncio.TimeoutError:

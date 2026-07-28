@@ -24,7 +24,10 @@ class ToolRouteDecision:
 
 
 _DOMAIN_PATTERNS = {
-    "notes": re.compile(r"便签|笔记|待办|备忘|记录|记一下|记下来|标签|回收站|置顶"),
+    "notes": re.compile(
+        r"便签|笔记|待办|备忘|记录|记一下|记下来|标签|回收站|置顶|"
+        r"改内容|修改内容|改正文|修改正文|改标题|修改标题"
+    ),
     "ui": re.compile(r"界面|页面|打开|显示|切到|回到|搜索框"),
     "confirmation": re.compile(r"确认|取消|拒绝|待确认"),
     "weather": re.compile(r"天气|气温|温度|下雨|降雨|刮风|空气质量"),
@@ -54,7 +57,7 @@ _ACTION_HINTS = {
     "get": re.compile(r"读取|读一下|详情|内容|编号"),
     "append": re.compile(r"追加|补充|补一句|后面加"),
     "update_title": re.compile(r"改名|改标题|标题改"),
-    "replace": re.compile(r"替换|覆盖|全部改成|正文改"),
+    "replace": re.compile(r"替换|覆盖|全部改成|正文改|改内容|修改内容|改正文|修改正文"),
     "delete": re.compile(r"删除|删掉|移除"),
     "restore": re.compile(r"恢复|还原|找回"),
     "pin": re.compile(r"置顶|取消置顶"),
@@ -205,3 +208,31 @@ def select_candidate_tools(
         available_tool_count=len(available),
         candidate_schema_chars=schema_chars,
     )
+
+
+def parse_plain_tool_call(
+    content: str, tools: Iterable[Dict[str, Any]]
+) -> Dict[str, Any] | None:
+    """Parse provider fallbacks such as ``notes_search{"query":"x"}``.
+
+    Only names from the already-authorized candidate set are accepted. Natural
+    language and trailing text are rejected, so malformed provider output is
+    never executed as an arbitrary tool request.
+    """
+    value = (content or "").strip()
+    if value.startswith("```") and value.endswith("```"):
+        value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.I)
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_.]*)\s*(\{.*\})", value, re.S)
+    if match is None:
+        return None
+    allowed = {_tool_name(tool) for tool in tools or []}
+    name = match.group(1)
+    if name not in allowed:
+        return None
+    try:
+        arguments = json.loads(match.group(2))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return {"name": name, "arguments": arguments}

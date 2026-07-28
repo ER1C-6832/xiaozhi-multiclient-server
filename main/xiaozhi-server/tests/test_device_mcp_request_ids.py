@@ -87,3 +87,150 @@ def test_device_mcp_internal_error_is_not_returned_to_user(monkeypatch):
         assert "Request id" not in response.response
 
     asyncio.run(scenario())
+
+
+def test_model_arguments_are_normalized_for_safe_note_lookup():
+    assert mcp_handler.normalize_device_tool_arguments(
+        "notes.search", {"query": "手柄", "limit": 1}
+    ) == {"query": "手柄", "limit": 5}
+    assert mcp_handler.normalize_device_tool_arguments(
+        "notes.resolve", {"query": "标题是3"}
+    ) == {"exact_title": "3"}
+    assert mcp_handler.normalize_device_tool_arguments(
+        "notes.resolve", {"query": "标题3的那条"}
+    ) == {"exact_title": "3"}
+
+
+def test_structured_business_failure_keeps_public_message(monkeypatch):
+    async def failed_lookup(*_args, **_kwargs):
+        return json.dumps(
+            {
+                "status": "failed",
+                "message": "未找到符合条件的便签",
+                "error_code": "note_not_found",
+            },
+            ensure_ascii=False,
+        )
+
+    async def scenario():
+        conn = make_connection()
+        await conn.mcp_client.set_ready(True)
+        monkeypatch.setattr(
+            "core.providers.tools.device_mcp.mcp_executor.call_mcp_tool",
+            failed_lookup,
+        )
+        response = await DeviceMCPExecutor(conn).execute(
+            conn, "notes_resolve", {"query": "不存在"}
+        )
+        assert response.action == Action.RESPONSE
+        assert response.response == "未找到符合条件的便签"
+
+    asyncio.run(scenario())
+
+
+def test_ambiguous_resolution_lists_titles_not_internal_ids(monkeypatch):
+    async def ambiguous(*_args, **_kwargs):
+        return json.dumps(
+            {
+                "status": "success",
+                "message": "存在多个候选，未自动选择",
+                "result": {
+                    "resolution_status": "ambiguous",
+                    "candidates": [
+                        {"note_id": 5, "title": "手柄包装清单"},
+                        {"note_id": 6, "title": "游戏手柄测试"},
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    async def scenario():
+        conn = make_connection()
+        await conn.mcp_client.set_ready(True)
+        monkeypatch.setattr(
+            "core.providers.tools.device_mcp.mcp_executor.call_mcp_tool",
+            ambiguous,
+        )
+        response = await DeviceMCPExecutor(conn).execute(
+            conn, "notes_resolve", {"query": "手柄"}
+        )
+        assert response.action == Action.RESPONSE
+        assert "手柄包装清单" in response.response
+        assert "游戏手柄测试" in response.response
+        assert "note_id" not in response.response
+        assert "编号" not in response.response
+
+    asyncio.run(scenario())
+
+
+def test_successful_mutation_uses_trusted_tool_message(monkeypatch):
+    async def created(*_args, **_kwargs):
+        return json.dumps(
+            {"status": "success", "message": "便签已创建", "result": {"note_id": 8}},
+            ensure_ascii=False,
+        )
+
+    async def scenario():
+        conn = make_connection()
+        await conn.mcp_client.set_ready(True)
+        monkeypatch.setattr(
+            "core.providers.tools.device_mcp.mcp_executor.call_mcp_tool", created
+        )
+        response = await DeviceMCPExecutor(conn).execute(
+            conn, "notes_create", {"title": "测试"}
+        )
+        assert response.action == Action.RESPONSE
+        assert response.response == "便签已创建"
+
+    asyncio.run(scenario())
+
+
+def test_pending_mutation_opens_confirmation_card(monkeypatch):
+    calls = []
+
+    async def pending_then_show(_conn, _client, tool_name, args, **_kwargs):
+        calls.append((tool_name, json.loads(args)))
+        if tool_name == "notes_delete":
+            return json.dumps(
+                {
+                    "status": "requires_confirmation",
+                    "message": "删除便签需要确认",
+                    "requires_confirmation": True,
+                    "confirmation_id": "confirm-safe-1",
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {"status": "success", "message": "确认窗口已显示"},
+            ensure_ascii=False,
+        )
+
+    async def scenario():
+        conn = make_connection()
+        await conn.mcp_client.set_ready(True)
+        await conn.mcp_client.add_tool(
+            {
+                "name": "ui.show_confirmation",
+                "description": "show confirmation",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        )
+        monkeypatch.setattr(
+            "core.providers.tools.device_mcp.mcp_executor.call_mcp_tool",
+            pending_then_show,
+        )
+        response = await DeviceMCPExecutor(conn).execute(
+            conn, "notes_delete", {"note_ids": [7]}
+        )
+        assert response.action == Action.RESPONSE
+        assert "请在客户端确认卡片中确认" in response.response
+        assert calls == [
+            ("notes_delete", {"note_ids": [7]}),
+            (
+                "ui_show_confirmation",
+                {"confirmation_id": "confirm-safe-1"},
+            ),
+        ]
+
+    asyncio.run(scenario())
