@@ -812,10 +812,26 @@ class ConnectionHandler:
         try:
             # 异步获取差异化配置
             await self._initialize_private_config_async()
+            if self.stop_event.is_set():
+                self.logger.bind(tag=TAG).debug(
+                    "连接已关闭，跳过后台组件初始化"
+                )
+                return
             # 在线程池中初始化组件
-            self.executor.submit(self._initialize_components)
+            executor = self.executor
+            if executor is None:
+                self.logger.bind(tag=TAG).debug(
+                    "连接执行器已释放，跳过后台组件初始化"
+                )
+                return
+            executor.submit(self._initialize_components)
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"后台初始化失败: {e}")
+            if self.stop_event.is_set():
+                self.logger.bind(tag=TAG).debug(
+                    f"连接关闭期间终止后台初始化: {type(e).__name__}"
+                )
+            else:
+                self.logger.bind(tag=TAG).error(f"后台初始化失败: {e}")
 
     async def _initialize_private_config_async(self):
         """从接口异步获取差异化配置（异步版本，不阻塞主循环）"""
