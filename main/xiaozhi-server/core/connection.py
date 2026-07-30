@@ -44,8 +44,10 @@ from core.providers.tools.tool_workflow import (
     continuation_route,
     guard_unverified_text,
     infer_operation,
+    is_target_rejection,
     is_cancellation,
     is_mutation,
+    selector_clarification,
     should_replace_pending,
     start_workflow,
     workflow_completed,
@@ -186,6 +188,7 @@ class ConnectionHandler:
         # llm相关变量
         self.dialogue = Dialogue()
         self._pending_tool_workflow = None
+        self._last_tool_workflow = None
         self._turn_tool_outcomes = []
 
         # tts相关变量
@@ -1081,10 +1084,22 @@ class ConnectionHandler:
             )
         available = list(self.func_handler.get_functions() or [])
         pending = getattr(self, "_pending_tool_workflow", None)
+        if pending is None and is_target_rejection(query):
+            previous = getattr(self, "_last_tool_workflow", None)
+            if previous is not None and not previous.is_expired():
+                self._mcp_target_provenance = {}
+                self._pending_tool_workflow = previous.touch()
+                return continuation_route(
+                    self._pending_tool_workflow, available
+                )
         if pending is not None:
             if pending.is_expired() or is_cancellation(query):
                 self._pending_tool_workflow = None
                 self._mcp_target_provenance = {}
+            elif is_target_rejection(query):
+                self._mcp_target_provenance = {}
+                self._pending_tool_workflow = pending.touch()
+                return continuation_route(self._pending_tool_workflow, available)
             elif not should_replace_pending(pending, query):
                 self._pending_tool_workflow = pending.touch()
                 return continuation_route(self._pending_tool_workflow, available)
@@ -1424,6 +1439,26 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
+            clarification = selector_clarification(
+                self._workflow_operation(), query
+            )
+            if clarification:
+                self.tts.tts_one_sentence(
+                    self, ContentType.TEXT, content_detail=clarification
+                )
+                self.tts.store_tts_text(current_sentence_id, clarification)
+                self.dialogue.put(
+                    Message(role="assistant", content=clarification)
+                )
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=current_sentence_id,
+                        sentence_type=SentenceType.LAST,
+                        content_type=ContentType.ACTION,
+                    )
+                )
+                self._finish_llm_usage_turn("clarification")
+                return True
         else:
             # 递归调用时，使用当前的sentence_id
             current_sentence_id = self.sentence_id
@@ -1835,6 +1870,7 @@ class ConnectionHandler:
 
         if depth == 0:
             if self._workflow_has_completed() or self._workflow_is_terminal():
+                self._last_tool_workflow = self._pending_tool_workflow
                 self._pending_tool_workflow = None
                 self._mcp_target_provenance = {}
             self.tts.tts_text_queue.put(

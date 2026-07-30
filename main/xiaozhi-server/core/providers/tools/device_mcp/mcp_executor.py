@@ -1,5 +1,6 @@
 """设备端MCP工具执行器"""
 
+import re
 from typing import Dict, Any, TYPE_CHECKING
 from config.logger import setup_logging
 
@@ -91,6 +92,38 @@ def _candidate_titles(payload: dict) -> list[str]:
     ]
 
 
+def _normalize_exact_title(value: Any) -> str:
+    title = str(value or "").strip()
+    title = re.sub(r"^标题(?:为|是|叫|名为)?\s*", "", title)
+    title = re.sub(r"\s*的(?:便签|笔记)?$", "", title)
+    return title.strip("“”\"' ")
+
+
+def _result_notes(payload: dict) -> list[dict]:
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return []
+    notes = result.get("notes")
+    if not isinstance(notes, list):
+        notes = result.get("candidates")
+    return [item for item in (notes or []) if isinstance(item, dict)]
+
+
+def _safe_read_summary(tool_name: str, payload: dict) -> str:
+    notes = _result_notes(payload)
+    if not notes:
+        return str(payload.get("message") or "没有找到符合条件的便签。")
+    rendered = []
+    for note in notes[:5]:
+        title = str(note.get("title") or "未命名").strip()
+        snippet = str(note.get("snippet") or "").strip()
+        rendered.append(
+            f"标题“{title}”" + (f"，内容“{snippet}”" if snippet else "")
+        )
+    prefix = "找到一条便签：" if len(notes) == 1 else f"找到{len(notes)}条便签："
+    return prefix + "；".join(rendered) + "。"
+
+
 class DeviceMCPExecutor(ToolExecutor):
     """设备端MCP工具执行器"""
 
@@ -101,6 +134,12 @@ class DeviceMCPExecutor(ToolExecutor):
         self, conn: "ConnectionHandler", tool_name: str, arguments: Dict[str, Any]
     ) -> ActionResponse:
         """执行设备端MCP工具"""
+        arguments = dict(arguments or {})
+        if tool_name == "notes_resolve" and "exact_title" in arguments:
+            normalized = _normalize_exact_title(arguments.get("exact_title"))
+            if normalized:
+                arguments["exact_title"] = normalized
+
         if not hasattr(conn, "mcp_client") or not conn.mcp_client:
             return ActionResponse(
                 action=Action.ERROR,
@@ -255,6 +294,44 @@ class DeviceMCPExecutor(ToolExecutor):
                     return ActionResponse(
                         action=Action.RESPONSE,
                         response=message or "设备工具操作已完成。",
+                        execution_succeeded=True,
+                        workflow_terminal=True,
+                    )
+                if status == "success" and tool_name in {
+                    "notes_search",
+                    "notes_list_recent",
+                    "notes_list_by_tag",
+                    "notes_list_deleted",
+                    "notes_list_todos",
+                    "notes_list_pinned",
+                    "notes_get",
+                }:
+                    return ActionResponse(
+                        action=Action.RESPONSE,
+                        response=_safe_read_summary(tool_name, resultJson),
+                        execution_succeeded=True,
+                        workflow_terminal=True,
+                    )
+                if status == "success" and tool_name == "notes_resolve":
+                    workflow = getattr(conn, "_pending_tool_workflow", None)
+                    if getattr(workflow, "operation", None) in {
+                        "delete",
+                        "restore",
+                        "replace_content",
+                        "update_title",
+                        "append",
+                        "pin",
+                        "get",
+                    }:
+                        return ActionResponse(
+                            action=Action.REQLLM,
+                            result=json.dumps(resultJson, ensure_ascii=False),
+                            execution_succeeded=True,
+                            workflow_terminal=False,
+                        )
+                    return ActionResponse(
+                        action=Action.RESPONSE,
+                        response=_safe_read_summary(tool_name, resultJson),
                         execution_succeeded=True,
                         workflow_terminal=True,
                     )

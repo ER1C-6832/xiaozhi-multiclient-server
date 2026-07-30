@@ -89,7 +89,20 @@ class ToolWorkflowTest(unittest.TestCase):
         route = WORKFLOW.continuation_route(workflow.touch(), TOOLS)
         self.assertEqual(
             [item["function"]["name"] for item in route.candidates],
-            ["notes_search"],
+            ["notes_search", "notes_resolve"],
+        )
+
+    def test_selectorless_search_is_clarified_without_tool_call(self):
+        self.assertIn(
+            "完整标题或关键词",
+            WORKFLOW.selector_clarification("search", "查一条便签"),
+        )
+
+    def test_target_rejection_discards_previous_choice(self):
+        self.assertTrue(WORKFLOW.is_target_rejection("不是这条"))
+        self.assertIn(
+            "上一条作废",
+            WORKFLOW.selector_clarification("search", "不是这条"),
         )
 
     def test_update_completion_requires_real_mutation_tool(self):
@@ -111,6 +124,16 @@ class ToolWorkflowTest(unittest.TestCase):
         )
         self.assertTrue(blocked)
         self.assertIn("尚未实际完成", text)
+
+    def test_mutation_clarification_is_not_blocked_as_false_success(self):
+        original = "找到目标了，请告诉我想把正文改成什么？"
+        text, blocked = WORKFLOW.guard_unverified_text(
+            "replace_content",
+            [{"name": "notes_resolve", "success": True}],
+            original,
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(text, original)
 
     def test_failed_mutation_does_not_authorize_success(self):
         text, blocked = WORKFLOW.guard_unverified_text(

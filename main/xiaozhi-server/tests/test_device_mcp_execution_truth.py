@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from core.providers.tools.device_mcp.mcp_client import MCPClient
-from core.providers.tools.device_mcp.mcp_executor import DeviceMCPExecutor
+from core.providers.tools.device_mcp.mcp_executor import (
+    DeviceMCPExecutor,
+    _normalize_exact_title,
+)
 
 
 def connection():
@@ -70,6 +73,9 @@ class DeviceMcpExecutionTruthTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.workflow_terminal)
 
     async def test_unique_resolver_success_is_explicit(self):
+        self.conn._pending_tool_workflow = SimpleNamespace(
+            operation="replace_content"
+        )
         response = await self.execute_with(
             "notes_resolve",
             {"exact_title": "3"},
@@ -85,7 +91,36 @@ class DeviceMcpExecutionTruthTest(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertTrue(response.execution_succeeded)
-        self.assertIsNone(response.workflow_terminal)
+        self.assertFalse(response.workflow_terminal)
+
+    def test_spoken_numeric_title_is_normalized(self):
+        self.assertEqual(_normalize_exact_title("标题3"), "3")
+        self.assertEqual(_normalize_exact_title("标题3的"), "3")
+        self.assertEqual(_normalize_exact_title("标题为验收便签写入"), "验收便签写入")
+
+    async def test_search_result_is_safe_terminal_text_not_raw_json(self):
+        response = await self.execute_with(
+            "notes_search",
+            {"query": "验收"},
+            {
+                "status": "success",
+                "message": "搜索完成",
+                "affected_note_ids": [8],
+                "result": {
+                    "notes": [
+                        {
+                            "note_id": 8,
+                            "title": "验收便签写入",
+                            "snippet": "嘻嘻哈哈",
+                        }
+                    ]
+                },
+            },
+        )
+        self.assertEqual(response.action.name, "RESPONSE")
+        self.assertTrue(response.workflow_terminal)
+        self.assertIn("验收便签写入", response.response)
+        self.assertNotIn("note_id", response.response)
 
 
 if __name__ == "__main__":

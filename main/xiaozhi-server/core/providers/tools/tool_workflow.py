@@ -31,7 +31,7 @@ _OPERATION_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
 
 _OPERATION_TOOLS = {
     "create": ("notes_create",),
-    "search": ("notes_search",),
+    "search": ("notes_resolve", "notes_search"),
     "search_exact": ("notes_resolve",),
     "list": ("notes_list",),
     "list_deleted": ("notes_list_deleted",),
@@ -46,7 +46,7 @@ _OPERATION_TOOLS = {
 
 _COMPLETION_TOOLS = {
     "create": ("notes_create",),
-    "search": ("notes_search",),
+    "search": ("notes_resolve", "notes_search"),
     "search_exact": ("notes_resolve",),
     "list": ("notes_list",),
     "list_deleted": ("notes_list_deleted",),
@@ -70,6 +70,38 @@ _MUTATIONS = {
 }
 
 _CANCEL_PATTERN = re.compile(r"取消|算了|不用了|停止|别弄了")
+_TARGET_REJECTION_PATTERN = re.compile(
+    r"^(?:不对|不是(?:这|那|它)?(?:一?条|一个)?|不是这个|找错了|选错了|换一条)[。！!，,\s]*$"
+)
+_GENERIC_SELECTOR_REQUESTS = {
+    "search": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:查|查找|查询|搜索|找|看看)(?:一条|一个|一下)?(?:便签|笔记)?[吧。！!，,\s]*$"
+    ),
+    "search_exact": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:查|查找|查询|搜索|找)(?:一条|一个|一下)?(?:便签|笔记)?[吧。！!，,\s]*$"
+    ),
+    "get": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:读取|读一下|打开)(?:一条|一个|一下)?(?:便签|笔记)?[吧。！!，,\s]*$"
+    ),
+    "delete": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:删除|删掉|移除)(?:一条|一个|一下)?(?:便签|笔记)?[吧。！!，,\s]*$"
+    ),
+    "restore": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:恢复|还原|找回)(?:一条|一个|一下)?(?:便签|笔记)?[吧。！!，,\s]*$"
+    ),
+    "replace_content": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:修改|改|替换|覆盖)(?:一条|一个|一下)?(?:便签|笔记)?(?:的)?(?:内容|正文)?[吧。！!，,\s]*$"
+    ),
+    "update_title": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:修改|改)(?:一条|一个|一下)?(?:便签|笔记)?(?:的)?标题[吧。！!，,\s]*$"
+    ),
+    "append": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:追加|补充|补一句)(?:一条|一个|一下)?(?:便签|笔记)?[吧。！!，,\s]*$"
+    ),
+    "pin": re.compile(
+        r"^(?:请|帮我|麻烦)?(?:置顶|取消置顶)(?:一条|一个|一下)?(?:便签|笔记)?[吧。！!，,\s]*$"
+    ),
+}
 
 
 def _tool_name(tool: Dict[str, Any]) -> str:
@@ -87,6 +119,21 @@ def infer_operation(query: str) -> Optional[str]:
 
 def is_cancellation(query: str) -> bool:
     return bool(_CANCEL_PATTERN.search(str(query or "")))
+
+
+def is_target_rejection(query: str) -> bool:
+    return bool(_TARGET_REJECTION_PATTERN.match(str(query or "").strip()))
+
+
+def selector_clarification(
+    operation: Optional[str], query: str
+) -> Optional[str]:
+    if is_target_rejection(query):
+        return "好的，上一条作废。请说正确便签的完整标题或关键词。"
+    pattern = _GENERIC_SELECTOR_REQUESTS.get(operation or "")
+    if pattern is not None and pattern.match(str(query or "").strip()):
+        return "请说要操作的便签完整标题或关键词。"
+    return None
 
 
 def is_mutation(operation: Optional[str]) -> bool:
@@ -126,6 +173,13 @@ def guard_unverified_text(
         operation in {"search", "search_exact", "list", "list_deleted", "get"}
         and re.search(r"正在.{0,8}(?:查找|搜索|查询|读取)", text)
     )
+    asks_for_information = re.search(
+        r"[？?]|(?:请|需要).{0,12}(?:提供|告诉|补充)|"
+        r"(?:哪条|哪个|什么|如何|怎么|想要).{0,12}(?:呢|吗|[？?])?",
+        text,
+    )
+    if asks_for_information:
+        return text, False
     if not completion_claim and not progress_only:
         return text, False
     if is_mutation(operation):
