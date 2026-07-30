@@ -69,8 +69,8 @@ token_budget:
   enabled: true
   # 顶层值是兼容回退；实际请求优先使用 chat/tool 分层配置。
   max_total_tokens_per_turn: 6000
-  max_llm_calls_per_turn: 2
-  max_tool_calls_per_turn: 3
+  max_llm_calls_per_turn: 4
+  max_tool_calls_per_turn: 6
   max_output_tokens_per_request: 120
   warn_at_percent: 80
   client_telemetry: true
@@ -87,11 +87,11 @@ token_budget:
       max_tools_per_request: 0
       max_tool_schema_chars_per_request: 0
       max_message_chars_per_request: 5000
-    # 工具请求：只允许小规模候选工具；修改/删除等链式操作允许一次有工具 follow-up。
+    # 工具请求：总 Token 是主要成本闸门；调用次数仅作为异常循环熔断器。
     tool:
       max_total_tokens_per_turn: 6000
-      max_llm_calls_per_turn: 2
-      max_tool_calls_per_turn: 3
+      max_llm_calls_per_turn: 4
+      max_tool_calls_per_turn: 6
       max_output_tokens_per_request: 120
       max_tools_per_request: 5
       max_tool_schema_chars_per_request: 5000

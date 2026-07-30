@@ -36,10 +36,22 @@ class Action(Enum):
 
 
 class ActionResponse:
-    def __init__(self, action: Action, result=None, response=None):
+    def __init__(
+        self,
+        action: Action,
+        result=None,
+        response=None,
+        execution_succeeded=None,
+        workflow_terminal=None,
+    ):
         self.action = action  # 动作类型
         self.result = result  # 动作产生的结果
         self.response = response  # 直接回复的内容
+        # None preserves compatibility for providers that do not expose a
+        # structured execution status. Device MCP sets this explicitly so a
+        # conversational response can never be mistaken for a completed write.
+        self.execution_succeeded = execution_succeeded
+        self.workflow_terminal = workflow_terminal
 
 
 class FunctionItem:

@@ -135,6 +135,8 @@ class DeviceMCPExecutor(ToolExecutor):
                     response=(
                         "未执行：目标尚未按便签标题唯一定位，请先按标题查找。"
                     ),
+                    execution_succeeded=False,
+                    workflow_terminal=True,
                 )
 
         try:
@@ -223,11 +225,15 @@ class DeviceMCPExecutor(ToolExecutor):
                             if confirmation_displayed
                             else f"{message or '该操作需要确认'}，但确认卡片暂时无法显示。"
                         ),
+                        execution_succeeded=False,
+                        workflow_terminal=True,
                     )
                 if status in {"failed", "blocked", "rejected"}:
                     return ActionResponse(
                         action=Action.RESPONSE,
                         response=message or "设备工具操作未完成。",
+                        execution_succeeded=False,
+                        workflow_terminal=True,
                     )
                 if tool_name == "notes_resolve" and isinstance(result_payload, dict):
                     if result_payload.get("resolution_status") == "ambiguous":
@@ -240,6 +246,8 @@ class DeviceMCPExecutor(ToolExecutor):
                                 if candidate_text
                                 else "找到多条候选，请直接说完整标题。"
                             ),
+                            execution_succeeded=False,
+                            workflow_terminal=False,
                         )
                 if status == "success" and tool_name in _MUTATING_TOOLS:
                     if tool_name in _ID_MUTATING_TOOLS:
@@ -247,12 +255,26 @@ class DeviceMCPExecutor(ToolExecutor):
                     return ActionResponse(
                         action=Action.RESPONSE,
                         response=message or "设备工具操作已完成。",
+                        execution_succeeded=True,
+                        workflow_terminal=True,
                     )
 
-            return ActionResponse(action=Action.REQLLM, result=str(result))
+            return ActionResponse(
+                action=Action.REQLLM,
+                result=str(result),
+                execution_succeeded=(
+                    status == "success" if isinstance(resultJson, dict) else None
+                ),
+                workflow_terminal=None,
+            )
 
         except ValueError as e:
-            return ActionResponse(action=Action.NOTFOUND, response=str(e))
+            return ActionResponse(
+                action=Action.NOTFOUND,
+                response=str(e),
+                execution_succeeded=False,
+                workflow_terminal=True,
+            )
         except Exception as e:
             logger.bind(tag=TAG).error(
                 f"设备端工具调用失败: tool={tool_name}, error={type(e).__name__}: {e}"
@@ -260,6 +282,8 @@ class DeviceMCPExecutor(ToolExecutor):
             return ActionResponse(
                 action=Action.ERROR,
                 response="设备工具操作暂时没有完成，请稍后重试。",
+                execution_succeeded=False,
+                workflow_terminal=True,
             )
 
     def get_tools(self) -> Dict[str, ToolDefinition]:

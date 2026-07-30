@@ -39,6 +39,17 @@ from core.providers.tools.tool_routing import (
     parse_plain_tool_call,
     select_candidate_tools,
 )
+from core.providers.tools.tool_workflow import (
+    completion_tools,
+    continuation_route,
+    guard_unverified_text,
+    infer_operation,
+    is_cancellation,
+    is_mutation,
+    should_replace_pending,
+    start_workflow,
+    workflow_completed,
+)
 from core.providers.llm.usage import (
     LLMUsageTurnTracker,
     TokenBudgetExceeded,
@@ -174,6 +185,8 @@ class ConnectionHandler:
 
         # llm相关变量
         self.dialogue = Dialogue()
+        self._pending_tool_workflow = None
+        self._turn_tool_outcomes = []
 
         # tts相关变量
         self.sentence_id = None
@@ -1051,6 +1064,17 @@ class ConnectionHandler:
                 candidate_schema_chars=0,
             )
         available = list(self.func_handler.get_functions() or [])
+        pending = getattr(self, "_pending_tool_workflow", None)
+        if pending is not None:
+            if pending.is_expired() or is_cancellation(query):
+                self._pending_tool_workflow = None
+                self._mcp_target_provenance = {}
+            elif not should_replace_pending(pending, query):
+                self._pending_tool_workflow = pending.touch()
+                return continuation_route(self._pending_tool_workflow, available)
+            else:
+                self._pending_tool_workflow = None
+                self._mcp_target_provenance = {}
         routing_config = self.config.get("tool_routing", {})
         previous_query = ""
         previous_assistant = ""
@@ -1084,7 +1108,7 @@ class ConnectionHandler:
         from core.utils.current_time import get_current_time_info
 
         current_time, today_date, today_weekday, lunar_date = get_current_time_info()
-        return (
+        prompt = (
             "你是实时中文语音助手。直接回答当前问题，默认只说1至2句话，"
             "通常不超过50个汉字；只有用户明确要求详细解释时才展开。"
             "内容要自然、准确、适合TTS朗读，不使用Markdown，不泄露内部错误、"
@@ -1097,6 +1121,16 @@ class ConnectionHandler:
             f"农历：{lunar_date.strip()}。\n"
             f"角色与业务要求：\n{base_prompt}"
         )
+        pending = getattr(self, "_pending_tool_workflow", None)
+        if pending is not None:
+            prompt += (
+                "\n当前有一个尚未完成的工具任务。"
+                f"原始请求：{pending.root_query}；动作：{pending.operation}。"
+                "当前用户消息是对该任务的参数补充。必须继续使用本次提供的工具；"
+                "如果参数仍不足，只追问缺少的一个参数。不得把参数补充当作普通聊天，"
+                "不得在工具返回成功前声称任务完成。"
+            )
+        return prompt
 
     @staticmethod
     def _requires_multi_step_tool_chain(query):
@@ -1151,6 +1185,13 @@ class ConnectionHandler:
                 for tool in available
                 if self._tool_function_name(tool) == "notes_resolve"
             ]
+        if depth == 0 and has_resolved_target:
+            return [
+                tool
+                for tool in candidates
+                if self._tool_function_name(tool)
+                not in {"notes_resolve", "notes_search"}
+            ]
         if depth == 1:
             return [
                 tool
@@ -1159,6 +1200,36 @@ class ConnectionHandler:
                 not in {"notes_resolve", "notes_search"}
             ]
         return candidates
+
+    def _workflow_operation(self):
+        pending = getattr(self, "_pending_tool_workflow", None)
+        return pending.operation if pending is not None else None
+
+    def _workflow_has_completed(self):
+        return workflow_completed(
+            self._workflow_operation(),
+            getattr(self, "_turn_tool_outcomes", []),
+        )
+
+    def _workflow_is_terminal(self):
+        required = set(completion_tools(self._workflow_operation()))
+        return bool(required) and any(
+            outcome.get("terminal") and outcome.get("name") in required
+            for outcome in getattr(self, "_turn_tool_outcomes", [])
+        )
+
+    def _guard_unverified_tool_text(self, content):
+        operation = self._workflow_operation()
+        guarded, was_blocked = guard_unverified_text(
+            operation,
+            getattr(self, "_turn_tool_outcomes", []),
+            content,
+        )
+        if was_blocked:
+            self.logger.bind(tag=TAG).warning(
+                f"Blocked unverified workflow text operation={operation}: {content}"
+            )
+        return guarded
 
     def _compact_dialogue(self):
         routing_config = self.config.get("tool_routing", {})
@@ -1300,11 +1371,31 @@ class ConnectionHandler:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self._active_tool_route = self._select_tool_route(query)
-            if self._active_tool_route.reason != "tool_parameter_continuation":
+            if self._active_tool_route.reason not in {
+                "tool_parameter_continuation",
+                "pending_tool_workflow",
+            }:
                 self._mcp_target_provenance = {}
+            if self._active_tool_route.route == "tool":
+                pending = getattr(self, "_pending_tool_workflow", None)
+                if pending is None:
+                    pending = start_workflow(
+                        query, self._active_tool_route
+                    )
+                    self._pending_tool_workflow = pending
+                    if pending is not None:
+                        self._active_tool_route = continuation_route(
+                            pending,
+                            list(self.func_handler.get_functions() or []),
+                        )
+            self._turn_tool_outcomes = []
+            workflow_operation = self._workflow_operation() or infer_operation(query)
             self._allow_tool_followup = (
                 self._active_tool_route.route == "tool"
-                and self._requires_multi_step_tool_chain(query)
+                and (
+                    is_mutation(workflow_operation)
+                    or self._requires_multi_step_tool_chain(query)
+                )
             )
             self._start_llm_usage_turn(
                 current_sentence_id, self._active_tool_route
@@ -1524,22 +1615,9 @@ class ConnectionHandler:
                 # A model response is not proof that a mutation happened.
                 # When tools were offered but none was called, never let an
                 # unverified completion claim reach the user.
-                if (
-                    self._requires_multi_step_tool_chain(query)
-                    and re.search(
-                        r"已.{0,12}(?:修改|改成|替换|覆盖|删除|恢复|"
-                        r"追加|置顶|绑定)|(?:修改|删除|恢复|替换).{0,8}"
-                        r"(?:完成|成功)",
-                        content_arguments,
-                    )
-                ):
-                    self.logger.bind(tag=TAG).warning(
-                        "Blocked unverified tool success claim: "
-                        f"{content_arguments}"
-                    )
-                    content_arguments = (
-                        "操作没有实际执行，请重新说明要处理的便签标题。"
-                    )
+                content_arguments = self._guard_unverified_tool_text(
+                    content_arguments
+                )
                 response_message.append(content_arguments)
                 self.tts.tts_text_queue.put(
                     TTSMessageDTO(
@@ -1678,6 +1756,24 @@ class ConnectionHandler:
                     try:
                         result = future.result(timeout=tool_call_timeout)
                         tool_results.append((result, tool_call_data))
+                        self._turn_tool_outcomes.append(
+                            {
+                                "name": tool_call_data.get("name"),
+                                "success": (
+                                    result.execution_succeeded
+                                    if getattr(
+                                        result, "execution_succeeded", None
+                                    )
+                                    is not None
+                                    else result.action
+                                    not in {Action.ERROR, Action.NOTFOUND}
+                                ),
+                                "action": getattr(result.action, "name", str(result.action)),
+                                "terminal": bool(
+                                    getattr(result, "workflow_terminal", False)
+                                ),
+                            }
+                        )
                         self._record_llm_tool_usage(
                             tool_call_data, result, tool_started_at
                         )
@@ -1694,6 +1790,14 @@ class ConnectionHandler:
                             result="哎呀，网络遇到点问题，请稍后再试下！",
                         )
                         tool_results.append((error_result, tool_call_data))
+                        self._turn_tool_outcomes.append(
+                            {
+                                "name": tool_call_data.get("name"),
+                                "success": False,
+                                "action": "ERROR",
+                                "terminal": True,
+                            }
+                        )
                         self._record_llm_tool_usage(
                             tool_call_data,
                             error_result,
@@ -1714,6 +1818,9 @@ class ConnectionHandler:
             self.dialogue.put(Message(role="assistant", content=text_buff))
 
         if depth == 0:
+            if self._workflow_has_completed() or self._workflow_is_terminal():
+                self._pending_tool_workflow = None
+                self._mcp_target_provenance = {}
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,

@@ -276,6 +276,53 @@ class LLMUsageTest(unittest.TestCase):
         self.assertEqual(summary["budget_reason"], "llm_call_limit")
         self.assertEqual(summary["llm_calls_started"], 1)
 
+    def test_tool_budget_allows_legitimate_four_stage_chain(self):
+        tracker = MODULE.LLMUsageTurnTracker(
+            logger=CapturingLogger(),
+            turn_id="turn-budget-workflow",
+            session_id="session-budget",
+            budget_config={
+                "enabled": True,
+                "max_total_tokens_per_turn": 6000,
+                "max_llm_calls_per_turn": 4,
+                "max_tool_calls_per_turn": 6,
+            },
+        )
+
+        purposes = (
+            "initial_response",
+            "resolver_followup",
+            "mutation_followup",
+            "final_summary",
+        )
+        self.assertEqual(
+            [tracker.next_request(purpose)["call_index"] for purpose in purposes],
+            [1, 2, 3, 4],
+        )
+        tracker.authorize_tools(2)
+        tracker.record_tool(
+            tool_name="notes_resolve",
+            argument_chars=10,
+            result_chars=50,
+            execution_ms=5,
+            action="REQLLM",
+            status="completed",
+            requires_llm_followup=True,
+        )
+        tracker.record_tool(
+            tool_name="notes_replace_content",
+            argument_chars=20,
+            result_chars=30,
+            execution_ms=5,
+            action="RESPONSE",
+            status="completed",
+            requires_llm_followup=False,
+        )
+
+        with self.assertRaises(MODULE.TokenBudgetExceeded) as caught:
+            tracker.next_request("unexpected_loop")
+        self.assertEqual(caught.exception.reason, "llm_call_limit")
+
     def test_budget_blocks_tools_after_real_token_limit(self):
         logger = CapturingLogger()
         tracker = MODULE.LLMUsageTurnTracker(

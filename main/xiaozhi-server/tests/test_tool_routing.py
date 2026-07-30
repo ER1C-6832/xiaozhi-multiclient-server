@@ -65,6 +65,16 @@ class ToolRoutingTest(unittest.TestCase):
         self.assertEqual(decision.reason, "tool_parameter_continuation")
         self.assertEqual(names[0], "notes_create")
 
+    def test_second_create_parameter_requires_durable_workflow_layer(self):
+        decision = MODULE.select_candidate_tools(
+            "和王总讨论项目报价",
+            TOOLS,
+            previous_query="标题写明天下午会议",
+            previous_assistant="请再告诉我便签正文",
+        )
+        self.assertEqual(decision.route, "chat")
+        self.assertEqual(decision.reason, "no_explicit_tool_domain")
+
     def test_modify_content_is_an_explicit_note_domain(self):
         decision = MODULE.select_candidate_tools("帮我改内容", TOOLS)
         self.assertEqual(decision.route, "tool")
