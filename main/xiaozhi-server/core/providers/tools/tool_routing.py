@@ -29,6 +29,7 @@ _DEVICE_TOOL_READINESS_REASONS = frozenset(
         "exact_title_lookup",
         "implicit_note_keyword_search",
         "note_keyword_search",
+        "recent_note_list",
     }
 )
 _REQUIRED_SINGLE_TOOL_REASONS = frozenset(
@@ -36,6 +37,7 @@ _REQUIRED_SINGLE_TOOL_REASONS = frozenset(
         "exact_title_lookup",
         "implicit_note_keyword_search",
         "note_keyword_search",
+        "recent_note_list",
     }
 )
 
@@ -126,8 +128,13 @@ _EXACT_TITLE_LOOKUP_PATTERN = re.compile(
 )
 
 _NOTE_KEYWORD_SEARCH_PATTERN = re.compile(
-    r"(?:搜索|查找|查询|找一下|找找|看看|查).{0,20}(?:便签|笔记)|"
-    r"(?:便签|笔记).{0,20}(?:搜索|查找|查询|找一下|找找|看看|查)"
+    r"(?:搜索|搜一下|搜|查找|查询|找一下|找找|找|看看|查).{0,20}(?:便签|笔记)|"
+    r"(?:便签|笔记).{0,20}(?:搜索|搜一下|搜|查找|查询|找一下|找找|找|看看|查)"
+)
+
+_RECENT_NOTE_LIST_PATTERN = re.compile(
+    r"(?:最近|最新|刚才|刚刚|新近).{0,12}(?:便签|笔记)|"
+    r"(?:便签|笔记).{0,12}(?:最近|最新|刚才|刚刚|新近)"
 )
 
 _IMPLICIT_RELATED_NOTE_PATTERN = re.compile(
@@ -137,6 +144,84 @@ _IMPLICIT_RELATED_NOTE_PATTERN = re.compile(
 _MUTATION_PATTERN = re.compile(
     r"删除|删掉|移除|恢复|还原|找回|追加|补充|改成|换成|"
     r"修改|替换|覆盖|置顶|绑定"
+)
+
+_GENERIC_NOTE_SEARCH_FILLERS = tuple(
+    sorted(
+        {
+            "麻烦你帮我",
+            "麻烦帮我",
+            "能不能帮我",
+            "可以帮我",
+            "请你帮我",
+            "帮我查一下",
+            "帮我找一下",
+            "帮我看看",
+            "帮我",
+            "给我",
+            "替我",
+            "麻烦",
+            "请问",
+            "请",
+            "能不能",
+            "可以不可以",
+            "可以",
+            "帮忙",
+            "搜索一下",
+            "查询一下",
+            "查找一下",
+            "找一下",
+            "查一下",
+            "搜一下",
+            "看一下",
+            "搜索",
+            "查询",
+            "查找",
+            "找找",
+            "查查",
+            "搜搜",
+            "看看",
+            "打开",
+            "读取",
+            "读一下",
+            "读",
+            "找",
+            "查",
+            "搜",
+            "看",
+            "任意一个",
+            "随便一个",
+            "随便一条",
+            "某一个",
+            "一个",
+            "一条",
+            "一则",
+            "某个",
+            "某条",
+            "几个",
+            "几条",
+            "随便",
+            "一下",
+            "我的",
+            "我这边",
+            "这里",
+            "里面",
+            "小智便签应用",
+            "小智便签",
+            "便签应用",
+            "便签app",
+            "小智",
+            "便签",
+            "笔记",
+            "记录",
+            "内容",
+            "详情",
+            "标题",
+            "的",
+        },
+        key=len,
+        reverse=True,
+    )
 )
 
 
@@ -165,8 +250,29 @@ def _query_domains(query: str) -> set[str]:
     }
 
 
+def _compact_text(value: str) -> str:
+    return re.sub(r"[\W_]+", "", (value or "").lower(), flags=re.UNICODE)
+
+
+def _is_generic_note_search_query(query: str) -> bool:
+    """Return True when a note lookup contains no semantic target.
+
+    Examples blocked here include ``查便签`` and ``查一个便签``.  A phrase
+    such as ``查王总报价的便签`` retains ``王总报价`` after filler removal and
+    therefore remains a valid keyword search.
+    """
+
+    compact = _compact_text(query)
+    if not compact or not any(noun in compact for noun in ("便签", "笔记", "记录")):
+        return False
+    stripped = compact
+    for phrase in _GENERIC_NOTE_SEARCH_FILLERS:
+        stripped = stripped.replace(_compact_text(phrase), "")
+    return not stripped
+
+
 def _bigrams(value: str) -> set[str]:
-    compact = re.sub(r"[\W_]+", "", value.lower(), flags=re.UNICODE)
+    compact = _compact_text(value)
     return {
         compact[index : index + 2]
         for index in range(max(0, len(compact) - 1))
@@ -189,6 +295,37 @@ def _score(query: str, tool: Dict[str, Any], domains: set[str]) -> int:
         overlap = query_bigrams.intersection(_bigrams(description))
         score += min(18, len(overlap) * 3)
     return score
+
+
+def _single_tool_decision(
+    available: List[Dict[str, Any]],
+    tool_name: str,
+    reason: str,
+) -> ToolRouteDecision:
+    selected = next(
+        (tool for tool in available if _tool_name(tool) == tool_name),
+        None,
+    )
+    candidates = [selected] if selected is not None else []
+    schema_chars = (
+        len(
+            json.dumps(
+                candidates,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+        if candidates
+        else 0
+    )
+    return ToolRouteDecision(
+        route="tool" if candidates else "chat",
+        reason=reason if candidates else "domain_without_candidate",
+        candidates=candidates,
+        available_tool_count=len(available),
+        candidate_schema_chars=schema_chars,
+    )
 
 
 def select_candidate_tools(
@@ -236,40 +373,25 @@ def select_candidate_tools(
             and not _MUTATION_PATTERN.search(normalized_query)
         )
         if exact_title_lookup:
-            resolver = next(
-                (
-                    tool
-                    for tool in available
-                    if _tool_name(tool) == "notes_resolve"
-                ),
-                None,
+            return _single_tool_decision(
+                available,
+                "notes_resolve",
+                "exact_title_lookup",
             )
-            candidates = [resolver] if resolver is not None else []
-            reason = (
-                "exact_title_lookup"
-                if candidates
-                else "domain_without_candidate"
+
+        recent_note_list = bool(
+            "标签" not in normalized_query
+            and not _MUTATION_PATTERN.search(normalized_query)
+            and _RECENT_NOTE_LIST_PATTERN.search(normalized_query)
+        )
+        if recent_note_list:
+            return _single_tool_decision(
+                available,
+                "notes_list_recent",
+                "recent_note_list",
             )
-            schema_chars = (
-                len(
-                    json.dumps(
-                        candidates,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        default=str,
-                    )
-                )
-                if candidates
-                else 0
-            )
-            return ToolRouteDecision(
-                route="tool" if candidates else "chat",
-                reason=reason,
-                candidates=candidates,
-                available_tool_count=len(available),
-                candidate_schema_chars=schema_chars,
-            )
-        note_keyword_search = bool(
+
+        note_search_match = bool(
             "标签" not in normalized_query
             and not _MUTATION_PATTERN.search(normalized_query)
             and (
@@ -277,39 +399,29 @@ def select_candidate_tools(
                 or _NOTE_KEYWORD_SEARCH_PATTERN.search(normalized_query)
             )
         )
-        if note_keyword_search:
-            search = next(
-                (
-                    tool
-                    for tool in available
-                    if _tool_name(tool) == "notes_search"
-                ),
-                None,
-            )
-            candidates = [search] if search is not None else []
-            schema_chars = (
-                len(
-                    json.dumps(
-                        candidates,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        default=str,
-                    )
-                )
-                if candidates
-                else 0
-            )
+        if (
+            note_search_match
+            and not implicit_note_search
+            and _is_generic_note_search_query(normalized_query)
+        ):
             return ToolRouteDecision(
-                route="tool" if candidates else "chat",
-                reason=(
+                route="chat",
+                reason="generic_note_search_requires_clarification",
+                candidates=[],
+                available_tool_count=len(available),
+                candidate_schema_chars=0,
+            )
+        if note_search_match:
+            return _single_tool_decision(
+                available,
+                "notes_search",
+                (
                     "implicit_note_keyword_search"
                     if implicit_note_search
                     else "note_keyword_search"
                 ),
-                candidates=candidates,
-                available_tool_count=len(available),
-                candidate_schema_chars=schema_chars,
             )
+
         ranked = sorted(
             (
                 (_score(normalized_query, tool, domains), index, tool)
@@ -366,7 +478,7 @@ def select_candidate_tools(
 def parse_plain_tool_call(
     content: str, tools: Iterable[Dict[str, Any]]
 ) -> Dict[str, Any] | None:
-    """Parse provider fallbacks such as ``notes_search{"query":"x"}``.
+    """Parse provider fallbacks such as ``notes_search{\"query\":\"x\"}``.
 
     Only names from the already-authorized candidate set are accepted. Natural
     language and trailing text are rejected, so malformed provider output is
