@@ -164,6 +164,9 @@ class LLMProvider(LLMProviderBase):
             "tools": functions,
             "stream_options": {"include_usage": True},
         }
+        tool_choice = kwargs.get("tool_choice")
+        if tool_choice is not None:
+            request_params["tool_choice"] = tool_choice
 
         optional_params = {
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),

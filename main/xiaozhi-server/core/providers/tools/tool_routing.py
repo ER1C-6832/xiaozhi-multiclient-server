@@ -23,6 +23,48 @@ class ToolRouteDecision:
     candidate_schema_chars: int
 
 
+_DEVICE_TOOL_READINESS_REASONS = frozenset(
+    {
+        "domain_without_candidate",
+        "exact_title_lookup",
+        "implicit_note_keyword_search",
+        "note_keyword_search",
+    }
+)
+_REQUIRED_SINGLE_TOOL_REASONS = frozenset(
+    {
+        "exact_title_lookup",
+        "implicit_note_keyword_search",
+        "note_keyword_search",
+    }
+)
+
+
+def should_wait_for_device_tools(decision: ToolRouteDecision) -> bool:
+    """Return whether chat fallback may only reflect an unfinished MCP list."""
+
+    return (
+        decision.route == "chat"
+        and not decision.candidates
+        and decision.reason in _DEVICE_TOOL_READINESS_REASONS
+    )
+
+
+def required_tool_choice(decision: ToolRouteDecision) -> Dict[str, Any] | None:
+    """Force deterministic read routes instead of letting the model decline."""
+
+    if (
+        decision.route != "tool"
+        or decision.reason not in _REQUIRED_SINGLE_TOOL_REASONS
+        or len(decision.candidates) != 1
+    ):
+        return None
+    name = _tool_name(decision.candidates[0])
+    if not name:
+        return None
+    return {"type": "function", "function": {"name": name}}
+
+
 _DOMAIN_PATTERNS = {
     "notes": re.compile(
         r"便签|笔记|待办|备忘|记录|记一下|记下来|标签|回收站|置顶|"
@@ -81,6 +123,15 @@ _CLARIFICATION_PATTERN = re.compile(
 _EXACT_TITLE_LOOKUP_PATTERN = re.compile(
     r"(?:搜索|查找|查询|找一下|找找|看看).{0,12}"
     r"标题(?:为|是|叫|名为)"
+)
+
+_NOTE_KEYWORD_SEARCH_PATTERN = re.compile(
+    r"(?:搜索|查找|查询|找一下|找找|看看|查).{0,20}(?:便签|笔记)|"
+    r"(?:便签|笔记).{0,20}(?:搜索|查找|查询|找一下|找找|看看|查)"
+)
+
+_IMPLICIT_RELATED_NOTE_PATTERN = re.compile(
+    r"^[\w\u4e00-\u9fff]{1,24}(?:相关|有关)(?:的)?(?:便签|笔记)?[。！!？?\s]*$"
 )
 
 _MUTATION_PATTERN = re.compile(
@@ -153,6 +204,14 @@ def select_candidate_tools(
     normalized_query = (query or "").strip().lower()
     domains = _query_domains(normalized_query)
     continuation = False
+    implicit_note_search = bool(
+        normalized_query
+        and "标签" not in normalized_query
+        and not domains
+        and _IMPLICIT_RELATED_NOTE_PATTERN.match(normalized_query)
+    )
+    if implicit_note_search:
+        domains = {"notes"}
 
     if (
         normalized_query
@@ -206,6 +265,47 @@ def select_candidate_tools(
             return ToolRouteDecision(
                 route="tool" if candidates else "chat",
                 reason=reason,
+                candidates=candidates,
+                available_tool_count=len(available),
+                candidate_schema_chars=schema_chars,
+            )
+        note_keyword_search = bool(
+            "标签" not in normalized_query
+            and not _MUTATION_PATTERN.search(normalized_query)
+            and (
+                implicit_note_search
+                or _NOTE_KEYWORD_SEARCH_PATTERN.search(normalized_query)
+            )
+        )
+        if note_keyword_search:
+            search = next(
+                (
+                    tool
+                    for tool in available
+                    if _tool_name(tool) == "notes_search"
+                ),
+                None,
+            )
+            candidates = [search] if search is not None else []
+            schema_chars = (
+                len(
+                    json.dumps(
+                        candidates,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                )
+                if candidates
+                else 0
+            )
+            return ToolRouteDecision(
+                route="tool" if candidates else "chat",
+                reason=(
+                    "implicit_note_keyword_search"
+                    if implicit_note_search
+                    else "note_keyword_search"
+                ),
                 candidates=candidates,
                 available_tool_count=len(available),
                 candidate_schema_chars=schema_chars,

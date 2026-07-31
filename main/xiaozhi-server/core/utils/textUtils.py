@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -71,12 +72,22 @@ def is_punctuation_or_emoji(char):
         "-",
         "－",  # 英文连字符 + 中文全角横线
         "、",  # 中文顿号
+        "；",
+        ";",
+        "？",
+        "?",
+        "~",
+        "～",
         "[",
         "]",  # 方括号
         "【",
         "】",  # 中文方括号
     }
-    if char.isspace() or char in punctuation_set:
+    if (
+        char.isspace()
+        or char in punctuation_set
+        or unicodedata.category(char).startswith("P")
+    ):
         return True
     return is_emoji(char)
 

@@ -162,12 +162,23 @@ class OpenAIUsageStreamingTest(unittest.TestCase):
                 [{"role": "user", "content": "加便签"}],
                 functions=tools,
                 usage_context=usage_context(events),
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "notes.create"},
+                },
             )
         )
 
         self.assertEqual(len(output), 1)
         self.assertEqual(
             completions.request["stream_options"], {"include_usage": True}
+        )
+        self.assertEqual(
+            completions.request["tool_choice"],
+            {
+                "type": "function",
+                "function": {"name": "notes.create"},
+            },
         )
         self.assertEqual(events[0]["input_tokens"], 100)
         self.assertEqual(events[0]["tool_count"], 1)

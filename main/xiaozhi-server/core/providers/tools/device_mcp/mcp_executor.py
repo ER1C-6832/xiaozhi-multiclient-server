@@ -113,6 +113,12 @@ def _safe_read_summary(tool_name: str, payload: dict) -> str:
     notes = _result_notes(payload)
     if not notes:
         return str(payload.get("message") or "没有找到符合条件的便签。")
+    if len(notes) > 1:
+        titles = [
+            str(note.get("title") or "未命名").strip()
+            for note in notes[:5]
+        ]
+        return f"找到{len(notes)}条便签：" + "、".join(titles) + "。"
     rendered = []
     for note in notes[:5]:
         title = str(note.get("title") or "未命名").strip()
@@ -120,8 +126,7 @@ def _safe_read_summary(tool_name: str, payload: dict) -> str:
         rendered.append(
             f"标题“{title}”" + (f"，内容“{snippet}”" if snippet else "")
         )
-    prefix = "找到一条便签：" if len(notes) == 1 else f"找到{len(notes)}条便签："
-    return prefix + "；".join(rendered) + "。"
+    return "找到一条便签：" + "。".join(rendered) + "。"
 
 
 class DeviceMCPExecutor(ToolExecutor):

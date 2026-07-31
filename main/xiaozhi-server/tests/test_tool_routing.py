@@ -34,6 +34,8 @@ TOOLS = [
     tool("notes_search", "按关键词搜索便签。"),
     tool("notes_replace_content", "整体替换明确便签的正文。"),
     tool("notes_delete", "删除明确指定的便签。"),
+    tool("notes_list_by_tag", "按精确标签列出便签。"),
+    tool("tags_search", "搜索已知标签。"),
     tool("play_music", "播放音乐或歌曲。"),
     tool("get_weather", "查询其他城市天气。"),
 ]
@@ -88,6 +90,55 @@ class ToolRoutingTest(unittest.TestCase):
         self.assertEqual(decision.route, "tool")
         self.assertEqual(decision.reason, "exact_title_lookup")
         self.assertEqual(names, ["notes_resolve"])
+
+    def test_related_customer_phrase_routes_to_note_search_without_memory(self):
+        decision = MODULE.select_candidate_tools("客户相关", TOOLS)
+        names = [item["function"]["name"] for item in decision.candidates]
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.reason, "implicit_note_keyword_search")
+        self.assertEqual(names, ["notes_search"])
+        self.assertEqual(
+            MODULE.required_tool_choice(decision),
+            {
+                "type": "function",
+                "function": {"name": "notes_search"},
+            },
+        )
+
+    def test_related_customer_phrase_waits_for_device_mcp_tool_list(self):
+        decision = MODULE.select_candidate_tools(
+            "客户相关",
+            [tool("get_weather", "查询天气")],
+        )
+        self.assertEqual(decision.route, "chat")
+        self.assertEqual(decision.reason, "implicit_note_keyword_search")
+        self.assertTrue(MODULE.should_wait_for_device_tools(decision))
+
+    def test_normal_chat_does_not_wait_for_device_mcp_tool_list(self):
+        decision = MODULE.select_candidate_tools(
+            "你好",
+            [tool("get_weather", "查询天气")],
+        )
+        self.assertFalse(MODULE.should_wait_for_device_tools(decision))
+        self.assertIsNone(MODULE.required_tool_choice(decision))
+
+    def test_explicit_related_note_query_never_stops_at_tag_search(self):
+        decision = MODULE.select_candidate_tools(
+            "查客户相关的便签", TOOLS
+        )
+        names = [item["function"]["name"] for item in decision.candidates]
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.reason, "note_keyword_search")
+        self.assertEqual(names, ["notes_search"])
+        self.assertNotIn("tags_search", names)
+
+    def test_explicit_tag_lookup_still_uses_tag_tools(self):
+        decision = MODULE.select_candidate_tools(
+            "有没有客户相关的标签", TOOLS
+        )
+        names = [item["function"]["name"] for item in decision.candidates]
+        self.assertEqual(decision.route, "tool")
+        self.assertIn("tags_search", names)
 
     def test_referential_replace_is_not_misclassified_as_chat(self):
         decision = MODULE.select_candidate_tools(

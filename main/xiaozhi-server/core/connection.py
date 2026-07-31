@@ -37,7 +37,9 @@ from core.providers.tools.unified_tool_handler import UnifiedToolHandler
 from core.providers.tools.tool_routing import (
     ToolRouteDecision,
     parse_plain_tool_call,
+    required_tool_choice,
     select_candidate_tools,
+    should_wait_for_device_tools,
 )
 from core.providers.tools.tool_workflow import (
     completion_tools,
@@ -1119,7 +1121,7 @@ class ConnectionHandler:
             if message.role == "user" and previous_assistant:
                 previous_query = content
                 break
-        return select_candidate_tools(
+        decision = select_candidate_tools(
             query or "",
             available,
             previous_query=previous_query,
@@ -1129,6 +1131,50 @@ class ConnectionHandler:
                 routing_config.get("max_tool_schema_chars", 5000)
             ),
         )
+        mcp_client = getattr(self, "mcp_client", None)
+        if (
+            should_wait_for_device_tools(decision)
+            and mcp_client is not None
+            and not bool(getattr(mcp_client, "ready", False))
+        ):
+            timeout_seconds = min(
+                5.0,
+                max(
+                    0.0,
+                    float(
+                        routing_config.get(
+                            "device_mcp_ready_timeout_seconds", 2.0
+                        )
+                    ),
+                ),
+            )
+            deadline = time.monotonic() + timeout_seconds
+            while (
+                not bool(getattr(mcp_client, "ready", False))
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.025)
+            if bool(getattr(mcp_client, "ready", False)):
+                self.func_handler.tool_manager.refresh_tools()
+                available = list(self.func_handler.get_functions() or [])
+                decision = select_candidate_tools(
+                    query or "",
+                    available,
+                    previous_query=previous_query,
+                    previous_assistant=previous_assistant,
+                    max_candidates=int(
+                        routing_config.get("max_candidates", 5)
+                    ),
+                    max_schema_chars=int(
+                        routing_config.get("max_tool_schema_chars", 5000)
+                    ),
+                )
+                self.logger.bind(tag=TAG).info(
+                    "设备MCP工具就绪后重新路由: "
+                    f"route={decision.route}, reason={decision.reason}, "
+                    f"candidates={len(decision.candidates)}"
+                )
+        return decision
 
     def _compact_system_prompt(self):
         routing_config = self.config.get("tool_routing", {})
@@ -1530,6 +1576,9 @@ class ConnectionHandler:
             budget_max_output_tokens = self._llm_budget_max_output_tokens()
             if budget_max_output_tokens is not None:
                 usage_kwargs["max_tokens"] = budget_max_output_tokens
+            tool_choice = required_tool_choice(self._active_tool_route)
+            if tool_choice is not None:
+                usage_kwargs["tool_choice"] = tool_choice
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(

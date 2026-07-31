@@ -122,6 +122,42 @@ class DeviceMcpExecutionTruthTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("验收便签写入", response.response)
         self.assertNotIn("note_id", response.response)
 
+    async def test_multiple_search_results_list_every_title_without_long_tts_body(self):
+        response = await self.execute_with(
+            "notes_search",
+            {"query": "客户"},
+            {
+                "status": "success",
+                "message": "搜索完成",
+                "affected_note_ids": [1, 2, 3],
+                "result": {
+                    "notes": [
+                        {
+                            "note_id": 1,
+                            "title": "客户样品寄送",
+                            "snippet": "很长的第一条正文",
+                        },
+                        {
+                            "note_id": 2,
+                            "title": "王总屏幕报价",
+                            "snippet": "很长的第二条正文",
+                        },
+                        {
+                            "note_id": 3,
+                            "title": "联系王总",
+                            "snippet": "很长的第三条正文",
+                        },
+                    ]
+                },
+            },
+        )
+        self.assertEqual(
+            response.response,
+            "找到3条便签：客户样品寄送、王总屏幕报价、联系王总。",
+        )
+        self.assertNotIn("正文", response.response)
+        self.assertNotIn("；", response.response)
+
 
 if __name__ == "__main__":
     unittest.main()
