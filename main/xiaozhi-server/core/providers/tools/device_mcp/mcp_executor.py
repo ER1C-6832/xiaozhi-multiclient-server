@@ -1,12 +1,15 @@
-"""设备端MCP工具执行器"""
+"""设备端 MCP 工具执行器。"""
 
-import re
-from typing import Dict, Any, TYPE_CHECKING
+import json
+from typing import Any, Dict, TYPE_CHECKING
+
 from config.logger import setup_logging
+from core.providers.tools.tool_arguments import normalize_tool_arguments
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
-from ..base import ToolType, ToolDefinition, ToolExecutor
+
+from ..base import ToolDefinition, ToolExecutor, ToolType
 from plugins_func.register import Action, ActionResponse
 from .mcp_handler import call_mcp_tool
 
@@ -51,6 +54,19 @@ _TARGET_PRODUCER_TOOLS = {
     "notes_list_pinned",
     "notes_create",
 }
+_RESOLVE_FOLLOWUP_OPERATIONS = {
+    "delete",
+    "restore",
+    "edit",
+    "replace_content",
+    "update_title",
+    "append",
+    "convert_type",
+    "pin",
+    "get",
+    "open_note",
+    "tag_bind",
+}
 
 
 def _requested_note_ids(arguments: Dict[str, Any]) -> set[int]:
@@ -92,13 +108,6 @@ def _candidate_titles(payload: dict) -> list[str]:
     ]
 
 
-def _normalize_exact_title(value: Any) -> str:
-    title = str(value or "").strip()
-    title = re.sub(r"^标题(?:为|是|叫|名为)?\s*", "", title)
-    title = re.sub(r"\s*的(?:便签|笔记)?$", "", title)
-    return title.strip("“”\"' ")
-
-
 def _result_notes(payload: dict) -> list[dict]:
     result = payload.get("result")
     if not isinstance(result, dict):
@@ -114,23 +123,18 @@ def _safe_read_summary(tool_name: str, payload: dict) -> str:
     if not notes:
         return str(payload.get("message") or "没有找到符合条件的便签。")
     if len(notes) > 1:
-        titles = [
-            str(note.get("title") or "未命名").strip()
-            for note in notes[:5]
-        ]
+        titles = [str(note.get("title") or "未命名").strip() for note in notes[:5]]
         return f"找到{len(notes)}条便签：" + "、".join(titles) + "。"
     rendered = []
     for note in notes[:5]:
         title = str(note.get("title") or "未命名").strip()
         snippet = str(note.get("snippet") or "").strip()
-        rendered.append(
-            f"标题“{title}”" + (f"，内容“{snippet}”" if snippet else "")
-        )
+        rendered.append(f"标题“{title}”" + (f"，内容“{snippet}”" if snippet else ""))
     return "找到一条便签：" + "。".join(rendered) + "。"
 
 
 class DeviceMCPExecutor(ToolExecutor):
-    """设备端MCP工具执行器"""
+    """设备端 MCP 工具执行器。"""
 
     def __init__(self, conn):
         self.conn = conn
@@ -138,31 +142,28 @@ class DeviceMCPExecutor(ToolExecutor):
     async def execute(
         self, conn: "ConnectionHandler", tool_name: str, arguments: Dict[str, Any]
     ) -> ActionResponse:
-        """执行设备端MCP工具"""
-        arguments = dict(arguments or {})
-        if tool_name == "notes_resolve" and "exact_title" in arguments:
-            normalized = _normalize_exact_title(arguments.get("exact_title"))
-            if normalized:
-                arguments["exact_title"] = normalized
+        arguments = normalize_tool_arguments(tool_name, arguments)
 
         if not hasattr(conn, "mcp_client") or not conn.mcp_client:
             return ActionResponse(
                 action=Action.ERROR,
                 response="设备端MCP客户端未初始化",
+                execution_succeeded=False,
+                workflow_terminal=False,
             )
 
         if not await conn.mcp_client.is_ready():
             return ActionResponse(
                 action=Action.ERROR,
                 response="设备端MCP客户端未准备就绪",
+                execution_succeeded=False,
+                workflow_terminal=False,
             )
 
         requested_ids = _requested_note_ids(arguments)
         if tool_name in _ID_CONSUMING_TOOLS:
             provenance = getattr(conn, "_mcp_target_provenance", {})
-            required_source = (
-                "resolved" if tool_name in _ID_MUTATING_TOOLS else "readable"
-            )
+            required_source = "resolved" if tool_name in _ID_MUTATING_TOOLS else "readable"
             unauthorized = {
                 note_id
                 for note_id in requested_ids
@@ -176,54 +177,44 @@ class DeviceMCPExecutor(ToolExecutor):
                 )
                 return ActionResponse(
                     action=Action.RESPONSE,
-                    response=(
-                        "未执行：目标尚未按便签标题唯一定位，请先按标题查找。"
-                    ),
+                    response="未执行：目标尚未按便签标题或内容唯一定位，请先查找目标。",
                     execution_succeeded=False,
-                    workflow_terminal=True,
+                    # This is retryable.  The durable workflow must stay alive.
+                    workflow_terminal=False,
                 )
 
         try:
-            # 转换参数为JSON字符串
-            import json
-
-            args_str = json.dumps(arguments) if arguments else "{}"
-
-            # 调用设备端MCP工具
+            args_str = json.dumps(arguments, ensure_ascii=False) if arguments else "{}"
             result = await call_mcp_tool(conn, conn.mcp_client, tool_name, args_str)
 
-            resultJson = None
+            result_json = None
             if isinstance(result, str):
                 try:
-                    resultJson = json.loads(result)
-                except Exception as e:
+                    result_json = json.loads(result)
+                except Exception:
                     pass
 
-            # 视觉大模型不经过二次LLM处理
             if (
-                resultJson is not None
-                and isinstance(resultJson, dict)
-                and "action" in resultJson
+                result_json is not None
+                and isinstance(result_json, dict)
+                and "action" in result_json
             ):
                 return ActionResponse(
-                    action=Action[resultJson["action"]],
-                    response=resultJson.get("response", ""),
+                    action=Action[result_json["action"]],
+                    response=result_json.get("response", ""),
                 )
 
-            if isinstance(resultJson, dict):
-                status = str(resultJson.get("status") or "")
-                message = str(resultJson.get("message") or "").strip()
-                requires_confirmation = bool(
-                    resultJson.get("requires_confirmation")
-                )
-                result_payload = resultJson.get("result")
+            status = ""
+            if isinstance(result_json, dict):
+                status = str(result_json.get("status") or "")
+                message = str(result_json.get("message") or "").strip()
+                requires_confirmation = bool(result_json.get("requires_confirmation"))
+                result_payload = result_json.get("result")
 
                 if status == "success" and tool_name in _TARGET_PRODUCER_TOOLS:
-                    affected_ids = _affected_note_ids(resultJson)
+                    affected_ids = _affected_note_ids(result_json)
                     if affected_ids:
-                        provenance = dict(
-                            getattr(conn, "_mcp_target_provenance", {})
-                        )
+                        provenance = dict(getattr(conn, "_mcp_target_provenance", {}))
                         source = (
                             "resolved"
                             if tool_name == "notes_resolve"
@@ -239,13 +230,9 @@ class DeviceMCPExecutor(ToolExecutor):
                 if requires_confirmation or status == "requires_confirmation":
                     if tool_name in _ID_MUTATING_TOOLS:
                         conn._mcp_target_provenance = {}
-                    confirmation_id = str(
-                        resultJson.get("confirmation_id") or ""
-                    ).strip()
+                    confirmation_id = str(result_json.get("confirmation_id") or "").strip()
                     confirmation_displayed = False
-                    if confirmation_id and conn.mcp_client.has_tool(
-                        "ui_show_confirmation"
-                    ):
+                    if confirmation_id and conn.mcp_client.has_tool("ui_show_confirmation"):
                         try:
                             await call_mcp_tool(
                                 conn,
@@ -270,18 +257,25 @@ class DeviceMCPExecutor(ToolExecutor):
                             else f"{message or '该操作需要确认'}，但确认卡片暂时无法显示。"
                         ),
                         execution_succeeded=False,
+                        # The mutation workflow has handed off to the separate
+                        # confirmation workflow, so this stage is terminal.
                         workflow_terminal=True,
                     )
+
                 if status in {"failed", "blocked", "rejected"}:
                     return ActionResponse(
                         action=Action.RESPONSE,
                         response=message or "设备工具操作未完成。",
                         execution_succeeded=False,
-                        workflow_terminal=True,
+                        # Failed/blocked target resolution and mutations are
+                        # retryable and must not discard the workflow.  A user
+                        # rejection is the only terminal negative result.
+                        workflow_terminal=(status == "rejected"),
                     )
+
                 if tool_name == "notes_resolve" and isinstance(result_payload, dict):
                     if result_payload.get("resolution_status") == "ambiguous":
-                        titles = _candidate_titles(resultJson)
+                        titles = _candidate_titles(result_json)
                         candidate_text = "、".join(titles)
                         return ActionResponse(
                             action=Action.RESPONSE,
@@ -293,6 +287,7 @@ class DeviceMCPExecutor(ToolExecutor):
                             execution_succeeded=False,
                             workflow_terminal=False,
                         )
+
                 if status == "success" and tool_name in _MUTATING_TOOLS:
                     if tool_name in _ID_MUTATING_TOOLS:
                         conn._mcp_target_provenance = {}
@@ -302,6 +297,7 @@ class DeviceMCPExecutor(ToolExecutor):
                         execution_succeeded=True,
                         workflow_terminal=True,
                     )
+
                 if status == "success" and tool_name in {
                     "notes_search",
                     "notes_list_recent",
@@ -313,30 +309,23 @@ class DeviceMCPExecutor(ToolExecutor):
                 }:
                     return ActionResponse(
                         action=Action.RESPONSE,
-                        response=_safe_read_summary(tool_name, resultJson),
+                        response=_safe_read_summary(tool_name, result_json),
                         execution_succeeded=True,
                         workflow_terminal=True,
                     )
+
                 if status == "success" and tool_name == "notes_resolve":
                     workflow = getattr(conn, "_pending_tool_workflow", None)
-                    if getattr(workflow, "operation", None) in {
-                        "delete",
-                        "restore",
-                        "replace_content",
-                        "update_title",
-                        "append",
-                        "pin",
-                        "get",
-                    }:
+                    if getattr(workflow, "operation", None) in _RESOLVE_FOLLOWUP_OPERATIONS:
                         return ActionResponse(
                             action=Action.REQLLM,
-                            result=json.dumps(resultJson, ensure_ascii=False),
+                            result=json.dumps(result_json, ensure_ascii=False),
                             execution_succeeded=True,
                             workflow_terminal=False,
                         )
                     return ActionResponse(
                         action=Action.RESPONSE,
-                        response=_safe_read_summary(tool_name, resultJson),
+                        response=_safe_read_summary(tool_name, result_json),
                         execution_succeeded=True,
                         workflow_terminal=True,
                     )
@@ -345,51 +334,50 @@ class DeviceMCPExecutor(ToolExecutor):
                 action=Action.REQLLM,
                 result=str(result),
                 execution_succeeded=(
-                    status == "success" if isinstance(resultJson, dict) else None
+                    status == "success" if isinstance(result_json, dict) else None
                 ),
                 workflow_terminal=None,
             )
 
-        except ValueError as e:
+        except ValueError as exc:
             return ActionResponse(
                 action=Action.NOTFOUND,
-                response=str(e),
+                response=str(exc),
                 execution_succeeded=False,
-                workflow_terminal=True,
+                workflow_terminal=False,
             )
-        except Exception as e:
+        except Exception as exc:
             logger.bind(tag=TAG).error(
-                f"设备端工具调用失败: tool={tool_name}, error={type(e).__name__}: {e}"
+                f"设备端工具调用失败: tool={tool_name}, error={type(exc).__name__}: {exc}"
             )
             return ActionResponse(
                 action=Action.ERROR,
                 response="设备工具操作暂时没有完成，请稍后重试。",
                 execution_succeeded=False,
-                workflow_terminal=True,
+                workflow_terminal=False,
             )
 
     def get_tools(self) -> Dict[str, ToolDefinition]:
-        """获取所有设备端MCP工具"""
         if not hasattr(self.conn, "mcp_client") or not self.conn.mcp_client:
             return {}
 
         tools = {}
         mcp_tools = self.conn.mcp_client.get_available_tools()
-
         for tool in mcp_tools:
             func_def = tool.get("function", {})
             tool_name = func_def.get("name", "")
-
             if tool_name:
                 tools[tool_name] = ToolDefinition(
-                    name=tool_name, description=tool, tool_type=ToolType.DEVICE_MCP
+                    name=tool_name,
+                    description=tool,
+                    tool_type=ToolType.DEVICE_MCP,
                 )
-
         return tools
 
     def has_tool(self, tool_name: str) -> bool:
-        """检查是否有指定的设备端MCP工具"""
         if not hasattr(self.conn, "mcp_client") or not self.conn.mcp_client:
             return False
-
         return self.conn.mcp_client.has_tool(tool_name)
+
+
+__all__ = ["DeviceMCPExecutor"]

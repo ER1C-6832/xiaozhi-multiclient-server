@@ -49,6 +49,7 @@ from core.providers.tools.tool_workflow import (
     is_target_rejection,
     is_cancellation,
     is_mutation,
+    requires_tool_followup,
     selector_clarification,
     should_replace_pending,
     start_workflow,
@@ -192,6 +193,7 @@ class ConnectionHandler:
         self._pending_tool_workflow = None
         self._last_tool_workflow = None
         self._turn_tool_outcomes = []
+        self._turn_workflow_operation = None
 
         # tts相关变量
         self.sentence_id = None
@@ -1090,7 +1092,7 @@ class ConnectionHandler:
             previous = getattr(self, "_last_tool_workflow", None)
             if previous is not None and not previous.is_expired():
                 self._mcp_target_provenance = {}
-                self._pending_tool_workflow = previous.touch()
+                self._pending_tool_workflow = previous.touch(query)
                 return continuation_route(
                     self._pending_tool_workflow, available
                 )
@@ -1100,10 +1102,10 @@ class ConnectionHandler:
                 self._mcp_target_provenance = {}
             elif is_target_rejection(query):
                 self._mcp_target_provenance = {}
-                self._pending_tool_workflow = pending.touch()
+                self._pending_tool_workflow = pending.touch(query)
                 return continuation_route(self._pending_tool_workflow, available)
             elif not should_replace_pending(pending, query):
-                self._pending_tool_workflow = pending.touch()
+                self._pending_tool_workflow = pending.touch(query)
                 return continuation_route(self._pending_tool_workflow, available)
             else:
                 self._pending_tool_workflow = None
@@ -1202,7 +1204,8 @@ class ConnectionHandler:
         if pending is not None:
             prompt += (
                 "\n当前有一个尚未完成的工具任务。"
-                f"原始请求：{pending.root_query}；动作：{pending.operation}。"
+                f"原始请求：{pending.root_query}；动作：{pending.operation}；"
+                f"已收集信息：{pending.context_summary()}。"
                 "当前用户消息是对该任务的参数补充。必须继续使用本次提供的工具；"
                 "如果参数仍不足，只追问缺少的一个参数。不得把参数补充当作普通聊天，"
                 "不得在工具返回成功前声称任务完成。"
@@ -1213,9 +1216,10 @@ class ConnectionHandler:
     def _requires_multi_step_tool_chain(query):
         return bool(
             re.search(
-                r"删除|删掉|移除|恢复|还原|找回|追加|补充|补一句|"
-                r"修改|改成|换成|改内容|改正文|改标题|替换|覆盖|置顶|取消置顶|"
-                r"绑定标签|换标签|删除标签|读取|读一下|打开.{0,8}便签",
+                r"删除|删掉|删|移除|恢复|还原|找回|追加|补充|补一句|"
+                r"修改|编辑|调整|改成|换成|改内容|改正文|改标题|替换|覆盖|"
+                r"置顶|取消置顶|绑定标签|加标签|移除标签|换标签|删除标签|"
+                r"标签页|分类页|读取|读一下|打开.{0,8}便签",
                 query or "",
             )
         )
@@ -1280,7 +1284,9 @@ class ConnectionHandler:
 
     def _workflow_operation(self):
         pending = getattr(self, "_pending_tool_workflow", None)
-        return pending.operation if pending is not None else None
+        if pending is not None:
+            return pending.operation
+        return getattr(self, "_turn_workflow_operation", None)
 
     def _workflow_has_completed(self):
         return workflow_completed(
@@ -1319,7 +1325,14 @@ class ConnectionHandler:
         )
 
     def _start_llm_usage_turn(self, turn_id, route_decision):
-        profile = "tool" if route_decision.route == "tool" else "chat"
+        # WORKFLOW_CORRECTNESS_V2: a durable pending task always receives the
+        # tool budget, even when the current utterance contains only a value.
+        profile = (
+            "tool"
+            if route_decision.route == "tool"
+            or getattr(self, "_pending_tool_workflow", None) is not None
+            else "chat"
+        )
         self._llm_usage_tracker = LLMUsageTurnTracker(
             logger=self.logger.bind(tag=TAG),
             turn_id=turn_id,
@@ -1445,6 +1458,8 @@ class ConnectionHandler:
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
+            # A turn-local operation must never leak into the next user turn.
+            self._turn_workflow_operation = None
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self._active_tool_route = self._select_tool_route(query)
@@ -1453,24 +1468,25 @@ class ConnectionHandler:
                 "pending_tool_workflow",
             }:
                 self._mcp_target_provenance = {}
-            if self._active_tool_route.route == "tool":
-                pending = getattr(self, "_pending_tool_workflow", None)
-                if pending is None:
-                    pending = start_workflow(
-                        query, self._active_tool_route
-                    )
-                    self._pending_tool_workflow = pending
-                    if pending is not None:
-                        self._active_tool_route = continuation_route(
-                            pending,
-                            list(self.func_handler.get_functions() or []),
-                        )
+            # Start durable state even for a generic selector that was routed
+            # to clarification-only chat (for example, "查一条便签").
+            pending = getattr(self, "_pending_tool_workflow", None)
+            if pending is None:
+                pending = start_workflow(query, self._active_tool_route)
+                self._pending_tool_workflow = pending
+            if pending is not None:
+                self._active_tool_route = continuation_route(
+                    pending,
+                    list(self.func_handler.get_functions() or []),
+                )
             self._turn_tool_outcomes = []
             workflow_operation = self._workflow_operation() or infer_operation(query)
+            self._turn_workflow_operation = workflow_operation
             self._allow_tool_followup = (
                 self._active_tool_route.route == "tool"
                 and (
-                    is_mutation(workflow_operation)
+                    requires_tool_followup(workflow_operation)
+                    or is_mutation(workflow_operation)
                     or self._requires_multi_step_tool_chain(query)
                 )
             )
@@ -1653,6 +1669,10 @@ class ConnectionHandler:
                                         )
                 else:
                     content = response
+                    # Buffer tool-free output until the complete sentence can
+                    # pass the same execution-truth guard as tool-capable output.
+                    if content is not None and len(content) > 0:
+                        content_arguments += content
 
                 # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
                 if emotion_flag and content is not None and content.strip():
@@ -1664,16 +1684,9 @@ class ConnectionHandler:
                     emotion_flag = False
 
                 if content is not None and len(content) > 0:
-                    if not tool_call_flag and functions is None:
-                        response_message.append(content)
-                        self.tts.tts_text_queue.put(
-                            TTSMessageDTO(
-                                sentence_id=current_sentence_id,
-                                sentence_type=SentenceType.MIDDLE,
-                                content_type=ContentType.TEXT,
-                                content_detail=content,
-                            )
-                        )
+                    # Tool-free text is intentionally not streamed before the
+                    # execution-truth guard has inspected the complete reply.
+                    pass
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
@@ -1694,6 +1707,18 @@ class ConnectionHandler:
                 )
                 self._finish_llm_usage_turn("stream_error")
             return
+
+        if functions is None and not tool_call_flag and content_arguments:
+            content_arguments = self._guard_unverified_tool_text(content_arguments)
+            response_message.append(content_arguments)
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=current_sentence_id,
+                    sentence_type=SentenceType.MIDDLE,
+                    content_type=ContentType.TEXT,
+                    content_detail=content_arguments,
+                )
+            )
 
         if functions is not None and not tool_call_flag and content_arguments:
             plain_call = parse_plain_tool_call(content_arguments, functions)

@@ -1,9 +1,9 @@
 """Cost-aware local routing for function-call requests.
 
 The router intentionally uses no model call.  It selects a small candidate set
-from tool metadata for explicit tool intents, and otherwise chooses the
-tool-free chat path.  False negatives are safer and cheaper than exposing every
-tool schema to an ambiguous request.
+for explicit tool intents and keeps normal conversation tool-free.  Durable
+multi-turn state lives in :mod:`tool_workflow`; this module only decides the
+initial candidate domain and a few deterministic read routes.
 """
 
 from __future__ import annotations
@@ -30,6 +30,9 @@ _DEVICE_TOOL_READINESS_REASONS = frozenset(
         "implicit_note_keyword_search",
         "note_keyword_search",
         "recent_note_list",
+        "deleted_note_list",
+        "pinned_note_list",
+        "todo_note_list",
     }
 )
 _REQUIRED_SINGLE_TOOL_REASONS = frozenset(
@@ -38,13 +41,14 @@ _REQUIRED_SINGLE_TOOL_REASONS = frozenset(
         "implicit_note_keyword_search",
         "note_keyword_search",
         "recent_note_list",
+        "deleted_note_list",
+        "pinned_note_list",
+        "todo_note_list",
     }
 )
 
 
 def should_wait_for_device_tools(decision: ToolRouteDecision) -> bool:
-    """Return whether chat fallback may only reflect an unfinished MCP list."""
-
     return (
         decision.route == "chat"
         and not decision.candidates
@@ -53,8 +57,6 @@ def should_wait_for_device_tools(decision: ToolRouteDecision) -> bool:
 
 
 def required_tool_choice(decision: ToolRouteDecision) -> Dict[str, Any] | None:
-    """Force deterministic read routes instead of letting the model decline."""
-
     if (
         decision.route != "tool"
         or decision.reason not in _REQUIRED_SINGLE_TOOL_REASONS
@@ -69,12 +71,15 @@ def required_tool_choice(decision: ToolRouteDecision) -> Dict[str, Any] | None:
 
 _DOMAIN_PATTERNS = {
     "notes": re.compile(
-        r"便签|笔记|待办|备忘|记录|记一下|记下来|标签|回收站|置顶|"
-        r"改内容|修改内容|改正文|修改正文|改标题|修改标题|"
-        r"这条|那条|改成|换成"
+        r"便签|笔记|待办|备忘|记录|记一下|记下来|标签|分类|回收站|置顶|"
+        r"改内容|修改内容|编辑内容|改正文|修改正文|编辑正文|"
+        r"改标题|修改标题|编辑标题|改名|重命名|追加|补充|"
+        r"这条|那条|某条"
     ),
-    "ui": re.compile(r"界面|页面|打开|显示|切到|回到|搜索框"),
-    "confirmation": re.compile(r"确认|取消|拒绝|待确认"),
+    "ui": re.compile(
+        r"界面|页面|页|视图|打开|显示|展示|切到|进入|回到|搜索框|主页"
+    ),
+    "confirmation": re.compile(r"确认|取消|拒绝|待确认|就这么做|执行吧"),
     "weather": re.compile(r"天气|气温|温度|下雨|降雨|刮风|空气质量"),
     "news": re.compile(r"新闻|热搜|资讯|头条"),
     "music": re.compile(r"音乐|歌曲|唱歌|播放|放一首|来一首"),
@@ -95,129 +100,92 @@ _NAME_DOMAINS = {
 }
 
 _ACTION_HINTS = {
-    "create": re.compile(r"创建|新建|新增|添加|加个|记个|记一下|记下来|记录"),
-    "search": re.compile(r"搜索|查找|找一下|找找|查询|看看"),
-    "resolve": re.compile(r"刚才那|那一条|那条|哪个|定位"),
-    "list": re.compile(r"列出|有哪些|最近|全部|列表|看看"),
-    "get": re.compile(r"读取|读一下|详情|内容|编号"),
-    "append": re.compile(r"追加|补充|补一句|后面加"),
-    "update_title": re.compile(r"改名|改标题|标题改"),
-    "replace": re.compile(
-        r"替换|覆盖|全部改成|正文改|改内容|修改内容|改正文|修改正文|"
-        r"(?:这条|那条|内容|正文|便签).{0,12}(?:改成|换成)|"
-        r".{0,12}的那条.{0,8}(?:改成|换成)"
+    "create": re.compile(r"创建|新建|新增|添加|加个|加一条|写一条|记个|记一下|记下来|记录一下|记录下来"),
+    "search": re.compile(r"搜索|搜|查找|找一下|找找|找|查询|查|看看"),
+    "resolve": re.compile(r"刚才那|那一条|那条|这条|哪个|定位|标题(?:为|是|叫|名为)"),
+    "list_recent": re.compile(r"最近|最新|刚才记|刚刚记"),
+    "list_deleted": re.compile(r"回收站|已删除"),
+    "list_todos": re.compile(r"待办"),
+    "list_pinned": re.compile(r"置顶|重要"),
+    "list_by_tag": re.compile(r"标签|分类"),
+    "get": re.compile(r"读取|读一下|念一下|详情|看看内容"),
+    "append": re.compile(r"追加|补充|补一句|补上|后面加|续写"),
+    "update_title": re.compile(r"改名|重命名|改标题|修改标题|标题改"),
+    "replace_content": re.compile(
+        r"替换|覆盖|重写|全部改成|正文改|内容改|改内容|修改内容|改正文|修改正文"
     ),
-    "delete": re.compile(r"删除|删掉|移除"),
+    "convert_type": re.compile(r"变成待办|改成待办|不再是待办|普通便签"),
+    "delete": re.compile(r"删除|删掉|删|移除"),
     "restore": re.compile(r"恢复|还原|找回"),
     "pin": re.compile(r"置顶|取消置顶"),
-    "show": re.compile(r"打开|显示|切到|回到"),
-    "confirm": re.compile(r"确认|同意|执行"),
-    "reject": re.compile(r"取消|拒绝|不要了"),
+    "bind": re.compile(r"绑定标签|加标签|移除标签|换标签|改标签"),
+    "show_tag": re.compile(r"标签页|分类页|打开标签|显示标签|切到标签"),
+    "show_trash": re.compile(r"打开回收站|显示回收站|切到回收站"),
+    "show_pinned": re.compile(r"打开置顶|显示置顶|切到置顶"),
+    "show_todos": re.compile(r"打开待办|显示待办|切到待办"),
+    "show_note_list": re.compile(r"全部便签|便签主页|便签列表"),
+    "show": re.compile(r"打开|显示|展示|切到|进入|回到"),
+    "confirm": re.compile(r"确认|同意|执行|就这么做"),
+    "reject": re.compile(r"取消|拒绝|不要了|算了"),
 }
 
 _CLARIFICATION_PATTERN = re.compile(
-    r"请.{0,12}(告诉|提供|补充|说明|选择)|"
-    r"(需要|还缺|缺少).{0,12}(什么|哪些|哪一|信息|内容|标题|地点|城市)|"
-    r"(什么|哪些|哪一|哪个|哪里|几号|几点|是否).{0,8}[？?]?$|"
+    r"请.{0,16}(告诉|提供|补充|说明|选择|说)|"
+    r"(?:给我|说一下|告诉我).{0,16}(?:标题|内容|正文|关键词|标签|分类|描述)|"
+    r"(需要|还缺|缺少).{0,16}(什么|哪些|哪一|信息|内容|标题|地点|城市|标签)|"
+    r"(什么|哪些|哪一|哪个|哪里|几号|几点|是否).{0,10}[？?]?$|"
     r"[？?]$"
 )
 
 _EXACT_TITLE_LOOKUP_PATTERN = re.compile(
-    r"(?:搜索|查找|查询|找一下|找找|看看).{0,12}"
+    r"(?:搜索|查找|查询|找一下|找找|找|查|看看).{0,16}"
     r"标题(?:为|是|叫|名为)"
 )
-
 _NOTE_KEYWORD_SEARCH_PATTERN = re.compile(
-    r"(?:搜索|搜一下|搜|查找|查询|找一下|找找|找|看看|查).{0,20}(?:便签|笔记)|"
-    r"(?:便签|笔记).{0,20}(?:搜索|搜一下|搜|查找|查询|找一下|找找|找|看看|查)"
+    r"(?:搜索|搜一下|搜|查找|查询|找一下|找找|找|看看|查).{0,24}(?:便签|笔记|记录)|"
+    r"(?:便签|笔记|记录).{0,24}(?:搜索|搜一下|搜|查找|查询|找一下|找找|找|看看|查)"
 )
-
 _RECENT_NOTE_LIST_PATTERN = re.compile(
     r"(?:最近|最新|刚才|刚刚|新近).{0,12}(?:便签|笔记)|"
     r"(?:便签|笔记).{0,12}(?:最近|最新|刚才|刚刚|新近)"
 )
-
+_DELETED_NOTE_LIST_PATTERN = re.compile(r"(?:回收站|已删除).{0,8}(?:便签|笔记)?")
+_PINNED_NOTE_LIST_PATTERN = re.compile(
+    r"(?:有哪些|列出|查看|看看|显示).{0,10}(?:置顶|重要).{0,8}(?:便签|笔记)|"
+    r"(?:置顶|重要).{0,8}(?:便签|笔记).{0,6}(?:有哪些|列表)"
+)
+_TODO_NOTE_LIST_PATTERN = re.compile(
+    r"(?:有哪些|列出|查看|看看|显示|打开).{0,10}待办(?:便签|笔记|列表)?|"
+    r"待办(?:便签|笔记).{0,6}(?:有哪些|列表)"
+)
 _IMPLICIT_RELATED_NOTE_PATTERN = re.compile(
     r"^[\w\u4e00-\u9fff]{1,24}(?:相关|有关)(?:的)?(?:便签|笔记)?[。！!？?\s]*$"
 )
-
 _MUTATION_PATTERN = re.compile(
-    r"删除|删掉|移除|恢复|还原|找回|追加|补充|改成|换成|"
-    r"修改|替换|覆盖|置顶|绑定"
+    r"删除|删掉|删|移除|恢复|还原|找回|追加|补充|改成|换成|修改|"
+    r"编辑|调整|替换|覆盖|重写|置顶|绑定|加标签|移除标签|换标签|改标签"
+)
+_ROOT_TOOL_INTENT_PATTERN = re.compile(
+    r"(?:创建|新建|新增|添加|加|写|记|搜索|搜|查找|查询|找|查|删除|删掉|删|"
+    r"移除|恢复|还原|找回|修改|改|编辑|调整|追加|补充|置顶|打开|读取|显示|切到)"
+    r".{0,18}(?:便签|笔记|标签|分类)|"
+    r"(?:便签|笔记|标签|分类).{0,18}(?:创建|新增|搜索|查找|查询|删除|删|恢复|修改|改|追加|置顶|打开)"
 )
 
 _GENERIC_NOTE_SEARCH_FILLERS = tuple(
     sorted(
         {
-            "麻烦你帮我",
-            "麻烦帮我",
-            "能不能帮我",
-            "可以帮我",
-            "请你帮我",
-            "帮我查一下",
-            "帮我找一下",
-            "帮我看看",
-            "帮我",
-            "给我",
-            "替我",
-            "麻烦",
-            "请问",
-            "请",
-            "能不能",
-            "可以不可以",
-            "可以",
-            "帮忙",
-            "搜索一下",
-            "查询一下",
-            "查找一下",
-            "找一下",
-            "查一下",
-            "搜一下",
-            "看一下",
-            "搜索",
-            "查询",
-            "查找",
-            "找找",
-            "查查",
-            "搜搜",
-            "看看",
-            "打开",
-            "读取",
-            "读一下",
-            "读",
-            "找",
-            "查",
-            "搜",
-            "看",
-            "任意一个",
-            "随便一个",
-            "随便一条",
-            "某一个",
-            "一个",
-            "一条",
-            "一则",
-            "某个",
-            "某条",
-            "几个",
-            "几条",
-            "随便",
-            "一下",
-            "我的",
-            "我这边",
-            "这里",
-            "里面",
-            "小智便签应用",
-            "小智便签",
-            "便签应用",
-            "便签app",
-            "小智",
-            "便签",
-            "笔记",
-            "记录",
-            "内容",
-            "详情",
-            "标题",
-            "的",
+            "麻烦你帮我", "麻烦帮我", "能不能帮我", "可以帮我", "请你帮我",
+            "帮我查一下", "帮我找一下", "帮我看看", "帮我", "给我", "替我",
+            "麻烦", "请问", "请", "能不能", "可以不可以", "可以", "帮忙",
+            "搜索一下", "查询一下", "查找一下", "找一下", "查一下", "搜一下",
+            "看一下", "搜索", "查询", "查找", "找找", "查查", "搜搜", "看看",
+            "打开", "读取", "读一下", "读", "找", "查", "搜", "看",
+            "任意一个", "随便一个", "随便一条", "某一个", "一个", "一条",
+            "一则", "某个", "某条", "几个", "几条", "随便", "一下",
+            "我的", "我这边", "这里", "里面", "小智便签应用", "小智便签",
+            "便签应用", "便签app", "小智", "便签", "笔记", "记录", "内容",
+            "详情", "标题", "的",
         },
         key=len,
         reverse=True,
@@ -255,13 +223,6 @@ def _compact_text(value: str) -> str:
 
 
 def _is_generic_note_search_query(query: str) -> bool:
-    """Return True when a note lookup contains no semantic target.
-
-    Examples blocked here include ``查便签`` and ``查一个便签``.  A phrase
-    such as ``查王总报价的便签`` retains ``王总报价`` after filler removal and
-    therefore remains a valid keyword search.
-    """
-
     compact = _compact_text(query)
     if not compact or not any(noun in compact for noun in ("便签", "笔记", "记录")):
         return False
@@ -284,12 +245,10 @@ def _score(query: str, tool: Dict[str, Any], domains: set[str]) -> int:
     description = _tool_description(tool)
     domain = _domain_for_name(name)
     score = 20 if domain in domains else 0
-
     normalized_name = name.replace(".", "_").lower()
     for action, pattern in _ACTION_HINTS.items():
         if pattern.search(query) and action in normalized_name:
             score += 14
-
     query_bigrams = _bigrams(query)
     if query_bigrams:
         overlap = query_bigrams.intersection(_bigrams(description))
@@ -308,14 +267,7 @@ def _single_tool_decision(
     )
     candidates = [selected] if selected is not None else []
     schema_chars = (
-        len(
-            json.dumps(
-                candidates,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=str,
-            )
-        )
+        len(json.dumps(candidates, ensure_ascii=False, separators=(",", ":"), default=str))
         if candidates
         else 0
     )
@@ -344,20 +296,30 @@ def select_candidate_tools(
     implicit_note_search = bool(
         normalized_query
         and "标签" not in normalized_query
+        and "分类" not in normalized_query
         and not domains
         and _IMPLICIT_RELATED_NOTE_PATTERN.match(normalized_query)
     )
     if implicit_note_search:
         domains = {"notes"}
 
+    # Compatibility fallback only.  Durable workflow state takes precedence in
+    # ConnectionHandler and no longer depends on these exact assistant words.
     if (
         normalized_query
-        and not domains
         and _CLARIFICATION_PATTERN.search((previous_assistant or "").strip())
     ):
-        previous_domains = _query_domains((previous_query or "").strip().lower())
-        if previous_domains:
-            domains = previous_domains
+        normalized_previous = (previous_query or "").strip().lower()
+        previous_domains = _query_domains(normalized_previous)
+        # This compatibility fallback is intentionally one hop only: the
+        # previous user message must itself contain an explicit tool request.
+        # Durable workflows handle longer conversations.
+        if (
+            previous_domains
+            and _ROOT_TOOL_INTENT_PATTERN.search(normalized_previous)
+            and not _ROOT_TOOL_INTENT_PATTERN.search(normalized_query)
+        ):
+            domains = domains or previous_domains
             normalized_query = f"{previous_query} {query}".strip().lower()
             continuation = True
 
@@ -373,26 +335,28 @@ def select_candidate_tools(
             and not _MUTATION_PATTERN.search(normalized_query)
         )
         if exact_title_lookup:
-            return _single_tool_decision(
-                available,
-                "notes_resolve",
-                "exact_title_lookup",
-            )
+            return _single_tool_decision(available, "notes_resolve", "exact_title_lookup")
 
-        recent_note_list = bool(
+        if (
             "标签" not in normalized_query
+            and "分类" not in normalized_query
             and not _MUTATION_PATTERN.search(normalized_query)
             and _RECENT_NOTE_LIST_PATTERN.search(normalized_query)
-        )
-        if recent_note_list:
-            return _single_tool_decision(
-                available,
-                "notes_list_recent",
-                "recent_note_list",
-            )
+        ):
+            return _single_tool_decision(available, "notes_list_recent", "recent_note_list")
+
+        if not _MUTATION_PATTERN.search(normalized_query) and _DELETED_NOTE_LIST_PATTERN.search(normalized_query):
+            return _single_tool_decision(available, "notes_list_deleted", "deleted_note_list")
+
+        if _PINNED_NOTE_LIST_PATTERN.search(normalized_query):
+            return _single_tool_decision(available, "notes_list_pinned", "pinned_note_list")
+
+        if _TODO_NOTE_LIST_PATTERN.search(normalized_query):
+            return _single_tool_decision(available, "notes_list_todos", "todo_note_list")
 
         note_search_match = bool(
             "标签" not in normalized_query
+            and "分类" not in normalized_query
             and not _MUTATION_PATTERN.search(normalized_query)
             and (
                 implicit_note_search
@@ -415,11 +379,7 @@ def select_candidate_tools(
             return _single_tool_decision(
                 available,
                 "notes_search",
-                (
-                    "implicit_note_keyword_search"
-                    if implicit_note_search
-                    else "note_keyword_search"
-                ),
+                "implicit_note_keyword_search" if implicit_note_search else "note_keyword_search",
             )
 
         ranked = sorted(
@@ -446,23 +406,12 @@ def select_candidate_tools(
             if proposed_chars <= max(0, int(max_schema_chars)):
                 candidates.append(tool)
         if candidates:
-            reason = (
-                "tool_parameter_continuation"
-                if continuation
-                else "explicit_tool_candidates"
-            )
+            reason = "tool_parameter_continuation" if continuation else "explicit_tool_candidates"
         else:
             reason = "domain_without_candidate"
 
     schema_chars = (
-        len(
-            json.dumps(
-                candidates,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=str,
-            )
-        )
+        len(json.dumps(candidates, ensure_ascii=False, separators=(",", ":"), default=str))
         if candidates
         else 0
     )
@@ -480,10 +429,9 @@ def parse_plain_tool_call(
 ) -> Dict[str, Any] | None:
     """Parse provider fallbacks such as ``notes_search{\"query\":\"x\"}``.
 
-    Only names from the already-authorized candidate set are accepted. Natural
-    language and trailing text are rejected, so malformed provider output is
-    never executed as an arbitrary tool request.
+    Only names from the already-authorized candidate set are accepted.
     """
+
     value = (content or "").strip()
     if value.startswith("```") and value.endswith("```"):
         value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.I)
