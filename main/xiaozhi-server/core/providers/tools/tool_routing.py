@@ -273,7 +273,7 @@ def _single_tool_decision(
     )
     return ToolRouteDecision(
         route="tool" if candidates else "chat",
-        reason=reason if candidates else "domain_without_candidate",
+        reason=reason,
         candidates=candidates,
         available_tool_count=len(available),
         candidate_schema_chars=schema_chars,
