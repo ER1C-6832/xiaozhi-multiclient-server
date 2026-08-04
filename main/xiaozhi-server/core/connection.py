@@ -71,6 +71,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.utils.tts_latency_trace import TTSLatencyTrace
 
 
 TAG = __name__
@@ -199,6 +200,7 @@ class ConnectionHandler:
         self.sentence_id = None
         # 处理TTS响应没有文本返回
         self.tts_MessageText = ""
+        self.tts_latency_trace = TTSLatencyTrace(self)
 
         # iot相关变量
         self.iot_descriptors = {}
@@ -1463,6 +1465,12 @@ class ConnectionHandler:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self._active_tool_route = self._select_tool_route(query)
+            self.tts_latency_trace.start_turn(
+                current_sentence_id,
+                query_chars=len(query or ""),
+                route=self._active_tool_route.route,
+                reason=self._active_tool_route.reason,
+            )
             if self._active_tool_route.reason not in {
                 "tool_parameter_continuation",
                 "pending_tool_workflow",
@@ -1595,6 +1603,13 @@ class ConnectionHandler:
             tool_choice = required_tool_choice(self._active_tool_route)
             if tool_choice is not None:
                 usage_kwargs["tool_choice"] = tool_choice
+            self.tts_latency_trace.mark(
+                "llm_request_started",
+                sentence_id=current_sentence_id,
+                first_only=True,
+                depth=depth,
+                tool_count=len(functions or []),
+            )
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
@@ -1684,9 +1699,22 @@ class ConnectionHandler:
                     emotion_flag = False
 
                 if content is not None and len(content) > 0:
+                    self.tts_latency_trace.mark(
+                        "llm_first_delta",
+                        sentence_id=current_sentence_id,
+                        first_only=True,
+                        delta_chars=len(content),
+                    )
                     # Tool-free text is intentionally not streamed before the
                     # execution-truth guard has inspected the complete reply.
                     pass
+            self.tts_latency_trace.mark(
+                "llm_stream_completed",
+                sentence_id=current_sentence_id,
+                first_only=True,
+                response_chars=len(content_arguments),
+                tool_call_detected=tool_call_flag,
+            )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(

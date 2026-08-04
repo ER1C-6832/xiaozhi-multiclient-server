@@ -10,6 +10,10 @@ from core.utils import textUtils
 from core.utils.util import audio_to_data
 from core.providers.tts.dto.dto import SentenceType
 from core.utils.audioRateController import AudioRateController
+from core.utils.tts_latency_trace import (
+    emit_tts_latency_summary,
+    mark_tts_latency,
+)
 
 TAG = __name__
 # 音频帧时长（毫秒）
@@ -271,6 +275,15 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
         # 直接发送opus数据包
         await conn.websocket.send(opus_packet)
 
+    mark_tts_latency(
+        conn,
+        "tts_first_ws_audio_send",
+        sentence_id=getattr(conn, "sentence_id", None),
+        first_only=True,
+        packet_index=packet_index,
+        opus_bytes=len(opus_packet),
+    )
+
     # 更新流控状态
     flow_control["packet_count"] = packet_index + 1
     flow_control["sequence"] = sequence + 1
@@ -310,6 +323,23 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
+    if state == "sentence_start":
+        mark_tts_latency(
+            conn,
+            "tts_sentence_start_sent",
+            sentence_id=getattr(conn, "sentence_id", None),
+            first_only=True,
+        )
+    elif state == "stop":
+        mark_tts_latency(
+            conn,
+            "tts_stop_sent",
+            sentence_id=getattr(conn, "sentence_id", None),
+            first_only=True,
+        )
+        emit_tts_latency_summary(
+            conn, sentence_id=getattr(conn, "sentence_id", None)
+        )
 
 
 async def send_stt_message(conn: "ConnectionHandler", text):

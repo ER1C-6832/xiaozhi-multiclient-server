@@ -3,6 +3,7 @@ import uuid
 import edge_tts
 from datetime import datetime
 from core.providers.tts.base import TTSProviderBase
+from core.utils.tts_latency_trace import mark_tts_latency
 
 
 class TTSProvider(TTSProviderBase):
@@ -43,6 +44,16 @@ class TTSProvider(TTSProviderBase):
         )
 
     async def text_to_speak(self, text, output_file):
+        sentence_id = getattr(self, "current_sentence_id", None)
+        mark_tts_latency(
+            self.conn,
+            "tts_provider_request_started",
+            sentence_id=sentence_id,
+            first_only=True,
+            provider="edge",
+            text_chars=len(text or ""),
+            output_mode="file" if output_file else "memory",
+        )
         try:
             communicate = edge_tts.Communicate(
                 text,
@@ -51,24 +62,50 @@ class TTSProvider(TTSProviderBase):
                 volume=self.edge_volume,
                 pitch=self.edge_pitch,
             )
+            total_bytes = 0
+            chunk_count = 0
+            first_audio_seen = False
+            audio_buffer = bytearray()
+            file_handle = None
             if output_file:
-                # 确保目录存在并创建空文件
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                with open(output_file, "wb") as f:
-                    pass
-
-                # 流式写入音频数据
-                with open(output_file, "ab") as f:  # 改为追加模式避免覆盖
-                    async for chunk in communicate.stream():
-                        if chunk["type"] == "audio":  # 只处理音频数据块
-                            f.write(chunk["data"])
-            else:
-                # 返回音频二进制数据
-                audio_bytes = b""
+                file_handle = open(output_file, "wb")
+            try:
                 async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        audio_bytes += chunk["data"]
-                return audio_bytes
+                    if chunk["type"] != "audio":
+                        continue
+                    data = chunk["data"]
+                    chunk_count += 1
+                    total_bytes += len(data)
+                    if not first_audio_seen:
+                        first_audio_seen = True
+                        mark_tts_latency(
+                            self.conn,
+                            "tts_provider_first_audio_chunk",
+                            sentence_id=sentence_id,
+                            first_only=True,
+                            provider="edge",
+                            chunk_bytes=len(data),
+                        )
+                    if file_handle is not None:
+                        file_handle.write(data)
+                    else:
+                        audio_buffer.extend(data)
+            finally:
+                if file_handle is not None:
+                    file_handle.close()
+            mark_tts_latency(
+                self.conn,
+                "tts_provider_audio_completed",
+                sentence_id=sentence_id,
+                first_only=True,
+                provider="edge",
+                audio_bytes=total_bytes,
+                chunk_count=chunk_count,
+            )
+            if output_file is None:
+                return bytes(audio_buffer)
+            return None
         except Exception as e:
             error_msg = f"Edge TTS请求失败: {e}"
-            raise Exception(error_msg)  # 抛出异常，让调用方捕获
+            raise Exception(error_msg) from e
