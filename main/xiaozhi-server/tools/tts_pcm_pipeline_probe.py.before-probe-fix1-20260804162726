@@ -15,10 +15,11 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from unittest.mock import patch
 
 import numpy as np
 
+from core.handle.sendAudioHandle import sendAudio
+from core.utils.opus_encoder_utils import OpusEncoderUtils
 
 
 class _FakeLogger:
@@ -64,12 +65,6 @@ def _tone_pcm(sample_rate: int, duration_ms: int, frequency_hz: float) -> bytes:
 
 
 async def _run(args) -> dict:
-    # Keep the probe independent from deployed data/.config.yaml.
-    # The real send path is imported while logger initialization is stubbed.
-    with patch("config.logger.setup_logging", return_value=_FakeLogger()):
-        from core.handle.sendAudioHandle import sendAudio
-    from core.utils.opus_encoder_utils import OpusEncoderUtils
-
     started_ns = time.perf_counter_ns()
     pcm_started_ns = time.perf_counter_ns()
     pcm = _tone_pcm(args.sample_rate, args.duration_ms, args.frequency_hz)
