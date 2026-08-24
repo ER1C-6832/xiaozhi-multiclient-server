@@ -1,0 +1,3 @@
+services:
+  xiaozhi-esp32-server:
+    image: local/xiaozhi-esp32-server:diag-session-init-fix-001

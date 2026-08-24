@@ -1,0 +1,8 @@
+ARG LEGACY_IMAGE=local/xiaozhi-esp32-server:edge-full-ab-feature-20260805-181512
+FROM ${LEGACY_IMAGE}
+
+LABEL org.opencontainers.image.title="Xiaozhi Legacy session-init diagnostic"
+LABEL org.opencontainers.image.base.name="local/xiaozhi-esp32-server:edge-full-ab-feature-20260805-181512"
+
+COPY main/xiaozhi-server/core/utils/llm.py /opt/xiaozhi-esp32-server/core/utils/llm.py
+COPY main/xiaozhi-server/core/connection.py /opt/xiaozhi-esp32-server/core/connection.py
