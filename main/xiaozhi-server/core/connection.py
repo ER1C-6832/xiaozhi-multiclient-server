@@ -1452,6 +1452,32 @@ class ConnectionHandler:
         )
 
     def chat(self, query, depth=0):
+        if self.llm is None:
+            self.logger.bind(tag=TAG).error(
+                "Critical LLM unavailable: rejecting turn because Session LLM "
+                f"initialization did not complete; session_id={self.session_id}"
+            )
+            if self.websocket is not None and self.loop is not None:
+                payload = {
+                    "type": "error",
+                    "code": "llm_unavailable",
+                    "message": "LLM service is temporarily unavailable",
+                    "session_id": self.session_id,
+                }
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.websocket.send(
+                            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                        ),
+                        self.loop,
+                    )
+                    future.result(timeout=1)
+                except Exception as error:
+                    self.logger.bind(tag=TAG).error(
+                        f"Failed to send LLM unavailable error: {error}"
+                    )
+            return False
+
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
 
